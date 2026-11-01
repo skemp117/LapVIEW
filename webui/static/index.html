@@ -1,0 +1,309 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>LapVIEW</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+
+<header>
+  <span class="brand">LapVIEW</span>
+  <span id="modes">
+    <button id="modeSession" class="tab on">laps</button>
+    <button id="modeImport" class="tab">library</button>
+  </span>
+  <select id="picker" title="track"></select>
+  <span id="hint" class="muted"></span>
+  <span class="spacer"></span>
+</header>
+
+<div id="empty" class="pane hidden">
+  <p>The library is empty. Import a folder of RaceChrono CSVs and footage:
+    open <strong>library</strong>, choose the folder, and press Import.</p>
+</div>
+
+<main id="app" class="hidden">
+
+  <section id="stage">
+    <aside id="lapbar">
+      <div class="card grow">
+        <div class="cardhead">laps <span id="lapCount" class="muted"></span></div>
+        <!-- Selecting a second lap is what turns this into a comparison, so the
+             mode lives beside the list rather than in the tab bar. -->
+        <div id="lapTools">
+          <button id="lapMode" class="ghost">compare</button>
+          <button id="lapBest" class="ghost"
+                  title="the three quickest at this track">quickest 3</button>
+          <button id="lapClear" class="ghost">clear</button>
+          <button id="lapExport" class="ghost"
+                  title="render this lap with the overlay burned in">export</button>
+          <label class="toggle" id="lapSectorsRow">sectors
+            <input type="number" id="cmpSectors" value="8" min="2" max="24"
+                   step="1"></label>
+        </div>
+        <div id="lapHint" class="muted">Click a lap to watch it — everything
+          else is measured against it. Tick to compare, shift-tick for a
+          range.</div>
+        <div id="lapList" class="scroll"></div>
+      </div>
+    </aside>
+
+    <div id="videoWrap">
+      <video id="video" preload="auto" playsinline></video>
+      <canvas id="overlay"></canvas>
+      <div id="noVideo" class="hidden">
+        <p>no footage for this lap — the overlay below runs on the data clock</p>
+      </div>
+    </div>
+
+    <aside id="side">
+      <div class="card">
+        <div class="cardhead"><span id="mapName">map</span>
+          <span id="mapMeta" class="muted"></span></div>
+        <!-- One map slot, two drawings: the driven line, or where the time went
+             against the reference. Two maps side by side would be the same
+             shape twice. -->
+        <canvas id="map"></canvas>
+        <canvas id="cmpMap" class="hidden"></canvas>
+      </div>
+
+      <div class="card" id="thisLapCard">
+        <div class="cardhead">this lap <span id="lapMeta" class="muted"></span></div>
+        <div id="laps"></div>
+      </div>
+
+      <div class="card hidden" id="idealCard">
+        <div class="cardhead">ideal <span id="cmpIdealMeta" class="muted"></span></div>
+        <div id="cmpIdeal" class="readout"></div>
+      </div>
+
+      <div class="card">
+        <div class="cardhead">readout</div>
+        <div id="readout" class="readout"></div>
+      </div>
+    </aside>
+  </section>
+
+  <section id="transport">
+    <button id="play" class="primary" title="space">play</button>
+    <button id="back" class="ghost" title="left arrow">&minus;1s</button>
+    <button id="fwd" class="ghost" title="right arrow">+1s</button>
+    <span id="clock" class="clock">0:00.00</span>
+    <input type="range" id="seek" min="0" max="1000" value="0" step="1">
+    <span id="dur" class="clock muted">0:00.00</span>
+    <select id="rate" title="playback rate">
+      <option value="0.25">0.25&times;</option>
+      <option value="0.5">0.5&times;</option>
+      <option value="1" selected>1&times;</option>
+      <option value="2">2&times;</option>
+      <option value="4">4&times;</option>
+    </select>
+    <label class="toggle" title="o"><input type="checkbox" id="showOverlay"
+      checked> overlay</label>
+  </section>
+
+  <section id="tracks">
+    <div id="chanbar"></div>
+    <div id="plots"></div>
+  </section>
+
+  <section id="cmpBand" class="hidden">
+    <div class="card">
+      <div class="cardhead">
+        <span>time lost to the reference, by distance</span>
+        <span id="cmpDeltaMeta" class="muted"></span></div>
+      <div class="plot" id="cmpDeltaWrap"><canvas id="cmpDelta"></canvas>
+        <div class="label" id="cmpDeltaLabel"></div></div>
+      <div class="plot" id="cmpSpeedWrap"><canvas id="cmpSpeed"></canvas>
+        <div class="label" id="cmpSpeedLabel"></div></div>
+    </div>
+    <div class="card">
+      <div class="cardhead">sectors <span id="cmpSecMeta" class="muted"></span></div>
+      <div id="cmpSectors2" class="scroll"></div>
+    </div>
+  </section>
+
+  <footer>
+    <span id="status" class="muted"></span>
+    <span id="cmpStatus" class="muted"></span>
+    <span id="rateMeter" class="muted"></span>
+    <span class="spacer"></span>
+    <span id="perf" class="muted"></span>
+  </footer>
+</main>
+
+
+
+
+<main id="impApp" class="hidden">
+
+  <!-- what the library holds: rename, tag, delete -->
+  <section id="manage">
+    <div class="card wide">
+      <div class="cardhead">library
+        <span id="mgMeta" class="muted"></span></div>
+
+      <!-- Always here, greyed out when they have nothing to act on: a toolbar
+           that appears and disappears makes you hunt for it. -->
+      <div id="mgBar">
+        <button id="mgRename" class="ghost">rename</button>
+        <button id="mgTag" class="ghost">edit tags</button>
+        <button id="mgExport" class="ghost">export video</button>
+        <button id="mgDelVideo" class="ghost">delete video only</button>
+        <button id="mgDelete" class="ghost danger">delete</button>
+        <button id="mgClear" class="ghost">clear selection</button>
+        <span id="mgSel" class="muted"></span>
+      </div>
+
+      <div id="mgTree">
+        <div class="mgrow mghead">
+          <span class="c-name">name</span>
+          <span class="c-time">time</span>
+          <span class="c-vid">video</span>
+          <span class="c-tag">tags</span>
+        </div>
+      </div>
+      <div id="mgHint" class="muted">Click to select, ctrl-click to add,
+        shift-click for a range. Double-click a lap to play it, a folder to open
+        or close it.</div>
+    </div>
+  </section>
+
+  <!-- rendering an overlaid video, from the library rather than the originals -->
+  <section id="exports">
+    <div class="card wide">
+      <div class="cardhead">exports
+        <span id="expMeta" class="muted"></span></div>
+      <div id="expBar" class="progress hidden"><i id="expFill"></i></div>
+      <div id="expNow" class="muted"></div>
+      <div id="expList"></div>
+    </div>
+  </section>
+
+  <!-- step 1: choose a folder -->
+  <section id="impChoose">
+    <div class="card wide">
+      <div class="cardhead">import</div>
+      <div id="drop">
+        <strong>Drop a folder here</strong>
+        <span class="muted">or choose one — nothing is copied and nothing is
+          deleted; the folder is read where it sits</span>
+        <button id="srcBrowse" class="primary big">Choose folder…</button>
+        <input type="text" id="srcPath" placeholder="…or paste a path">
+      </div>
+      <div id="srcNote" class="muted"></div>
+
+      <div id="impNaming">
+        <div class="opt field"><span class="lbl">event</span>
+          <input type="text" id="optEvent"
+                 placeholder="GRIP Season 5 - Event 6"></div>
+        <div class="opt field"><span class="lbl">track</span>
+          <select id="optTrack">
+            <option value="">a new track, named below</option>
+          </select></div>
+        <div class="opt field" id="optTrackNameRow">
+          <span class="lbl">track name</span>
+          <input type="text" id="optTrackName"
+                 placeholder="GRIP Season 5 - Event 6"></div>
+        <div class="muted" id="impNamingWhy">Both are required. For autocross the
+          two are usually the same name; an event that ran more than one course
+          gets a track each, numbered from this name.</div>
+      </div>
+
+      <div id="impOptions">
+        <div class="optgrid">
+          <div class="optcol">
+            <div class="opthead">what to keep</div>
+            <label class="opt check"><input type="checkbox" id="optSkipEdge">
+              <span>skip out-laps and in-laps</span></label>
+            <label class="opt check"><input type="checkbox" id="optKeepBestOn">
+              <span>only the quickest</span>
+              <input type="number" id="optKeepBest" value="3" min="1" max="99">
+              <span>per session</span></label>
+            <label class="opt check"><input type="checkbox" id="optWithinOn">
+              <span>only laps within</span>
+              <input type="number" id="optWithin" value="5" min="1" max="100">
+              <span>% of the session best</span></label>
+            <label class="opt check"><input type="checkbox" id="optGapOn">
+              <span>skip laps with a GPS hole over</span>
+              <input type="number" id="optGap" value="50" min="5" max="2000">
+              <span>m</span></label>
+            <label class="opt check"><input type="checkbox" id="optRequireVideo">
+              <span>skip laps with no footage</span></label>
+          </div>
+
+          <div class="optcol">
+            <div class="opthead">video</div>
+            <label class="opt check"><input type="checkbox" id="optVideo" checked>
+              <span>import video</span>
+              <em>off keeps the telemetry only</em></label>
+            <label class="opt check"><input type="checkbox" id="optAudio" checked>
+              <span>keep audio</span>
+              <em>dropping it saves about 1%</em></label>
+            <div class="opt field"><span class="lbl">quality</span>
+              <select id="optCq">
+                <option value="22">CQ 22 — near source</option>
+                <option value="24">CQ 24 — can grow a section</option>
+                <option value="28" selected>CQ 28 — about a third smaller</option>
+                <option value="30">CQ 30 — about half</option>
+                <option value="32">CQ 32 — a third of source</option>
+              </select></div>
+            <div class="opt field"><span class="lbl">resolution</span>
+              <select id="optHeight">
+                <option value="">as recorded</option>
+                <option value="720">720p — about 52% smaller</option>
+              </select></div>
+            <div class="opt field"><span class="lbl">frame rate</span>
+              <select id="optFps">
+                <option value="">as recorded</option>
+                <option value="30">30 fps — about 44% smaller</option>
+              </select></div>
+            <div class="opt field"><span class="lbl">padding</span>
+              <input type="number" id="optPad" value="3" min="0" max="30"
+                     step="0.5">
+              <span>s either side</span></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="cmprow">
+        <button id="impRun" class="primary big" disabled>Import</button>
+        <span id="impRunNote" class="muted"></span>
+      </div>
+    </div>
+  </section>
+
+  <!-- step 2: working -->
+  <section id="impWorking" class="hidden">
+    <div class="card wide">
+      <div class="cardhead">importing</div>
+      <div id="impPhase"></div>
+      <div class="progress"><i id="impBar"></i></div>
+      <div id="impDetail" class="muted"></div>
+    </div>
+  </section>
+
+  <!-- step 3: review -->
+  <section id="impReview" class="hidden">
+    <div class="card wide">
+      <div class="cardhead">imported
+        <span class="revbuttons">
+          <button id="impAgain" class="ghost">import another folder</button>
+          <button id="impDone" class="primary">open the library</button>
+        </span></div>
+      <div id="revSummary" class="readout"></div>
+      <div id="revSafe"></div>
+    </div>
+    <div id="revTracks" class="scroll"></div>
+  </section>
+
+  <footer>
+    <span id="impStatus" class="muted"></span>
+  </footer>
+</main>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

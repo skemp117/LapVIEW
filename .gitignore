@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+.env
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Runtime data (paths from config.py)
+library/
+cache/
+Output/
+
+# Older library location (library.db + laps/ + tracks/)
+Laps/
+
+# Real sessions and footage; tests/data/ holds the fixed cut of these
+Raw Data/
+Raw Footage/
+
+# Stray footage and render output (VIDEO_EXTS in racechrono/video.py)
+*.mp4
+*.mov
+*.m4v
+*.mkv
+*.avi
+*.insv
+*.lrv
+!tests/data/*.mp4
+
+# Editors / OS
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+.DS_Store

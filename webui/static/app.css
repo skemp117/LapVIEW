@@ -1,0 +1,557 @@
+/* Dark because the video is: a light chrome around a track video means the
+   iris fights the screen every time the eye moves off the picture. */
+:root {
+  --bg:      #101318;
+  --panel:   #171b22;
+  --panel2:  #1d222b;
+  --line:    #262d38;
+  --text:    #c9d1d9;
+  --dim:     #7d8794;
+  --accent:  #4fa3ff;
+  --good:    #3ddc84;
+  --warn:    #e8b339;
+  --bad:     #e0564b;
+  --head:    38px;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0; height: 100%;
+  background: var(--bg); color: var(--text);
+  font: 13px/1.45 ui-sans-serif, system-ui, "Segoe UI", sans-serif;
+}
+
+body { display: flex; flex-direction: column; overflow: hidden; }
+
+.hidden { display: none !important; }
+.muted  { color: var(--dim); }
+.bad    { color: var(--bad); }
+/* A control that cannot be used has to look like it. */
+button:disabled, select:disabled, input:disabled {
+  opacity: .4; cursor: not-allowed;
+}
+.spacer { flex: 1; }
+
+/* ---------------------------------------------------------- header */
+
+header {
+  height: var(--head); flex: 0 0 var(--head);
+  display: flex; align-items: center; gap: 10px;
+  padding: 0 12px;
+  background: var(--panel); border-bottom: 1px solid var(--line);
+}
+
+.brand {
+  font-weight: 600; letter-spacing: .02em;
+  color: var(--text); white-space: nowrap; flex: 0 0 auto;
+}
+/* On a narrow window the session name used to wrap out of the header and print
+   over whatever was beside it. One line, clipped with an ellipsis: the full name
+   is in the readout and in the picker. */
+#hint { min-width: 0; overflow: hidden; text-overflow: ellipsis;
+        white-space: nowrap; }
+#modes { flex: 0 0 auto; display: flex; gap: 4px; }
+#picker { flex: 0 1 auto; min-width: 8em; max-width: 22em; }
+
+select, button, input[type=checkbox] {
+  font: inherit; color: var(--text);
+}
+
+select {
+  background: var(--panel2); border: 1px solid var(--line);
+  border-radius: 5px; padding: 3px 6px; max-width: 34ch;
+}
+
+button {
+  background: var(--panel2); border: 1px solid var(--line);
+  border-radius: 5px; padding: 3px 11px; cursor: pointer;
+}
+button:hover { border-color: #3a4451; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #05121f; font-weight: 600; }
+button.primary:hover { filter: brightness(1.08); }
+button.ghost:hover { background: #232a34; }
+
+.toggle { display: flex; align-items: center; gap: 5px; color: var(--dim); cursor: pointer; }
+.toggle input { accent-color: var(--accent); }
+
+/* ---------------------------------------------------------- layout */
+
+/* The page scrolls; nothing inside it is squeezed to fit a viewport.
+   Everything used to live inside `100vh` with `min-height: 0` on each box, so
+   content that did not fit was clipped instead of making the page longer -- the
+   lap note lost its second line, the readout lost its last two rows, and the
+   sidebar was cramped at any window height. */
+main { flex: 1; display: flex; flex-direction: column; min-height: 0;
+       overflow-y: auto; overflow-x: hidden; }
+
+#stage {
+  flex: 0 0 auto;
+  display: grid; gap: 8px; padding: 8px;
+  /* A sidebar in `rem` scales with the reader's font size, and `vw` keeps it a
+     sane share of a wide window: never below 17 rem, never above 26. */
+  grid-template-columns: clamp(11.5rem, 16vw, 17rem) minmax(0, 1fr)
+                         clamp(17rem, 24vw, 26rem);
+}
+#lapbar { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+#lapTools {
+  display: flex; flex-wrap: wrap; gap: 4px; align-items: center;
+  padding-bottom: 6px; margin-bottom: 4px;
+  border-bottom: 1px solid var(--line);
+}
+#lapTools .ghost { padding: 2px 7px; font-size: 12px; }
+#lapTools #lapMode.on {
+  background: var(--panel2); border-color: var(--accent); color: var(--text);
+  font-weight: 600;
+}
+#lapTools .toggle { font-size: 12px; }
+#lapHint { font-size: 11px; line-height: 1.35; padding: 0 1px 6px; }
+#lapTools input[type=number] {
+  width: 3.4em; background: var(--bg); border: 1px solid var(--line);
+  border-radius: 4px; color: var(--text); font: inherit; font-size: 12px;
+  padding: 1px 3px;
+}
+/* One row per lap, grouped under the event it was driven at. */
+/* The event name, then its date under it. A floated date landed on top of the
+   first lap row whenever the name took the whole line. */
+.lapgroup { padding: 7px 5px 2px; }
+.lapgroup:first-child { padding-top: 0; }
+.lapgroup .ev { display: block; font-size: 11px; font-weight: 600;
+                color: var(--text); text-transform: uppercase;
+                letter-spacing: .04em; overflow-wrap: anywhere; }
+.lapgroup .date { display: block; font-size: 10px; color: var(--dim); }
+.lapitem {
+  display: grid; grid-template-columns: 13px minmax(0, 1fr) auto;
+  gap: 6px; align-items: baseline;
+  padding: 2px 5px; border-radius: 4px; cursor: pointer;
+  font-variant-numeric: tabular-nums;
+}
+/* A real checkbox. Ticked, it takes the colour of that lap's trace, so the list
+   and the plots are read together rather than cross-referenced. */
+.lapitem .sw {
+  width: 11px; height: 11px; margin: 0; align-self: center; cursor: pointer;
+  accent-color: var(--dim);
+}
+/* In the comparison, and therefore in the plots. Every row shows its gap to the
+   reference; the tint and the swatch say which ones are actually drawn. */
+.lapitem.cmp { background: #1b2430; }
+
+.lapitem.ref { box-shadow: inset 2px 0 0 var(--accent); }
+.lapitem.ref .nm { font-weight: 600; }
+.lapitem .d { color: var(--dim); }
+.lapitem .d.up { color: var(--bad); }
+.lapitem .d.dn { color: var(--good); }
+.lapitem:hover { background: var(--panel2); }
+.lapitem.on { background: #23303f; }
+/* A narrow sidebar wraps the row rather than cutting the session time off:
+   truncating "12:32 run 1 no video" to "12:32 run 1 n…" loses the part that
+   distinguishes one lap from the next. */
+.lapitem .nm { min-width: 0; overflow-wrap: anywhere; }
+/* A name that will not fit wraps. It used to be `nowrap`, which meant a name
+   this could not shorten ran straight over the time beside it. */
+.lapitem .who { overflow-wrap: anywhere; }
+.lapitem .t { color: var(--dim); }
+.lapitem.on .t, .lapitem.best .t { color: var(--text); }
+.lapitem.best .t { color: var(--good); font-weight: 600; }
+.lapitem.edge { opacity: .55; }
+.lapitem .flag { color: var(--warn); font-size: 10px; margin-left: 3px;
+                 white-space: nowrap; }
+
+#videoWrap {
+  position: relative;
+  /* Its own shape rather than whatever height is left over. */
+  aspect-ratio: 16 / 9; max-height: 76vh; min-height: 12rem;
+  display: flex; align-items: center; justify-content: center;
+  background: #000; border: 1px solid var(--line); border-radius: 6px;
+  overflow: hidden;
+}
+#video  { max-width: 100%; max-height: 100%; display: block; }
+/* The overlay canvas is placed by app.js: the overlay frame letterboxed into
+   this box, which is where the browser paints the picture because the frame came
+   from the clip and shares its aspect. */
+#overlay { position: absolute; pointer-events: none; z-index: 2; }
+/* At the top, not centred: with no footage the overlay is drawn across the whole
+   container and a centred message would sit behind the gauges. */
+#noVideo {
+  position: absolute; inset: 0; z-index: 1;
+  display: flex; flex-direction: column; align-items: center;
+  justify-content: flex-start; gap: 4px; text-align: center; padding: 8px 20px;
+  color: var(--dim); font-size: 12px;
+}
+
+#side { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+
+.card {
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: 6px; padding: 7px 8px;
+  display: flex; flex-direction: column; min-width: 0;
+}
+/* `grow` used to mean "take the leftover height and clip your contents". It now
+   means "take leftover height if there is any", and a card is never shorter
+   than what it holds. */
+.card.grow { flex: 0 0 auto; }
+.cardhead {
+  display: flex; justify-content: space-between; align-items: baseline;
+  gap: 8px; margin-bottom: 5px;
+  font-weight: 600; font-size: 12px;
+}
+/* Long lists lengthen the page. A cap only where a list could run to hundreds
+   of rows, and then it is a share of the window rather than a pixel count. */
+.scroll { min-width: 0; max-height: 60vh; overflow-y: auto; }
+/* A sector table grows a column per sector, so it scrolls sideways inside its
+   card rather than pushing the page wide. */
+#cmpSectors2 { overflow-x: auto; }
+
+#map { width: 100%; display: block; }
+
+/* ------------------------------------------------------------- laps */
+
+.lap {
+  display: grid; grid-template-columns: 2.6em 1fr auto;
+  align-items: center; gap: 6px;
+  padding: 3px 5px; border-radius: 4px; cursor: pointer;
+  font-variant-numeric: tabular-nums;
+}
+.lap:hover { background: var(--panel2); }
+.lap.on    { background: #23303f; }
+.lap .n    { color: var(--dim); text-align: right; }
+.lap .bar  { height: 4px; border-radius: 2px; background: #2c3542; }
+.lap .bar > i { display: block; height: 100%; border-radius: 2px; background: var(--accent); }
+.lap.best .t { color: var(--good); font-weight: 600; }
+.lap.best .bar > i { background: var(--good); }
+.lap.edge .n, .lap.edge .t { opacity: .55; }
+
+/* --------------------------------------------------------- readout */
+
+.readout {
+  display: grid; grid-template-columns: 1fr auto;
+  gap: 1px 8px; font-variant-numeric: tabular-nums;
+}
+.readout .k { color: var(--dim); }
+.readout .v { text-align: right; }
+
+/* ------------------------------------------------------- transport */
+
+#transport {
+  flex: 0 0 auto;
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 10px;
+  background: var(--panel); border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+}
+.clock { font-variant-numeric: tabular-nums; min-width: 8ch; text-align: center; }
+#seek { flex: 1; accent-color: var(--accent); }
+
+/* ---------------------------------------------------------- traces */
+
+#tracks {
+  flex: 0 0 auto;
+  display: flex; flex-direction: column;
+  background: var(--bg);
+}
+
+#chanbar {
+  display: flex; flex-wrap: wrap; gap: 4px;
+  padding: 6px 10px 4px;
+}
+.chip {
+  border: 1px solid var(--line); background: var(--panel);
+  border-radius: 11px; padding: 1px 9px; font-size: 12px;
+  color: var(--dim); cursor: pointer; white-space: nowrap;
+}
+.chip:hover { border-color: #3a4451; color: var(--text); }
+.chip.on { color: #05121f; font-weight: 600; }
+
+#plots { padding: 0 10px 8px; }
+
+.plot { position: relative; margin-bottom: 5px; }
+/* The trace height is a CSS decision, not a division of leftover space: the
+   canvas asks the stylesheet how tall it is and sizes its backing store to
+   match. Adding a fourth channel makes the page longer instead of squashing the
+   other three. */
+.plot canvas { display: block; width: 100%;
+               height: clamp(4rem, 11vh, 9rem); }
+.plot .label {
+  position: absolute; left: 6px; top: 2px;
+  font-size: 11px; font-variant-numeric: tabular-nums;
+  pointer-events: none; text-shadow: 0 0 4px #000, 0 0 4px #000;
+}
+.plot .drop {
+  position: absolute; right: 4px; top: 1px;
+  color: var(--dim); cursor: pointer; padding: 0 4px; font-size: 12px;
+}
+.plot .drop:hover { color: var(--bad); }
+
+footer {
+  flex: 0 0 auto; display: flex; gap: 10px;
+  padding: 3px 12px; font-size: 12px;
+  background: var(--panel); border-top: 1px solid var(--line);
+}
+
+.pane { padding: 24px; }
+pre {
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: 6px; padding: 10px; overflow-x: auto;
+}
+
+/* ------------------------------------------------------- compare view */
+
+#modes { display: flex; gap: 2px; }
+.tab {
+  border-radius: 5px; padding: 3px 12px;
+  background: transparent; border: 1px solid transparent; color: var(--dim);
+}
+.tab:hover { color: var(--text); background: var(--panel2); }
+.tab.on {
+  background: var(--panel2); border-color: var(--line); color: var(--text);
+  font-weight: 600;
+}
+
+/* The comparison band under the transport: traces on the left, sectors beside
+   them. It takes the place of the channel plots, which keep their state. */
+#cmpBand {
+  flex: 0 0 auto; display: grid; gap: 8px; padding: 0 8px 8px;
+  grid-template-columns: minmax(0, 3fr) minmax(0, 2fr);
+}
+#cmpMap { width: 100%; display: block; }
+#cmpDelta { height: clamp(6rem, 17vh, 12rem); }
+#cmpSpeed { height: clamp(4.5rem, 13vh, 9rem); }
+#cmpDelta, #cmpSpeed { display: block; width: 100%; }
+
+.cmprow { display: flex; gap: 8px; align-items: center; margin-top: 5px; }
+.cmprow input[type=number] {
+  width: 4.5em; background: var(--panel2); border: 1px solid var(--line);
+  border-radius: 4px; color: var(--text); font: inherit; padding: 1px 4px;
+}
+
+/* A GPS hole, on the import review's lap table. Comparable, but not to be read
+   as measured. */
+.hole {
+  font-size: 10px; text-transform: uppercase; letter-spacing: .04em;
+  color: var(--warn); border: 1px solid var(--warn); border-radius: 3px;
+  padding: 0 3px; margin-left: 4px; opacity: .8;
+}
+
+table.sec {
+  width: 100%; border-collapse: collapse;
+  font-variant-numeric: tabular-nums; font-size: 12px;
+}
+table.sec th, table.sec td {
+  padding: 2px 5px; text-align: right; white-space: nowrap;
+  border-bottom: 1px solid var(--line);
+}
+table.sec th { color: var(--dim); font-weight: 500; }
+table.sec td.nm, table.sec th.nm { text-align: left; }
+table.sec td.best { color: var(--good); font-weight: 600; }
+table.sec td.up  { color: var(--bad); }
+table.sec td.dn  { color: var(--good); }
+table.sec tr.ideal td { color: var(--accent); border-top: 1px solid var(--line); }
+
+/* ------------------------------------------------------- import screen */
+
+#impApp { flex: 1; display: flex; flex-direction: column; min-height: 0;
+          overflow-y: auto; padding: 8px; gap: 8px; }
+/* The import screen scrolls as a whole. Its sections must not be flex items
+   that shrink: on a short display the card was given less height than its
+   contents needed and the second column of options spilled out past the card's
+   own border. */
+#impApp > section { display: flex; flex-direction: column; gap: 8px;
+                    flex: 0 0 auto; }
+#impApp > section > .card { flex: 0 0 auto; }
+.card.wide { max-width: 900px; width: 100%; align-self: center; }
+
+#drop {
+  display: flex; flex-direction: column; gap: 10px; align-items: center;
+  text-align: center; padding: 18px 16px;
+  border: 2px dashed var(--line); border-radius: 8px;
+  background: var(--panel2); transition: border-color .12s, background .12s;
+}
+#drop.over { border-color: var(--accent); background: #1b2836; }
+#drop strong { font-size: 17px; }
+#drop .muted { font-size: 12px; max-width: 40em; }
+#drop input[type=text] {
+  width: min(100%, 46em); background: var(--bg); border: 1px solid var(--line);
+  border-radius: 5px; color: var(--text); font: inherit; padding: 5px 8px;
+  text-align: center;
+}
+button.big { padding: 7px 20px; font-size: 14px; }
+
+#srcNote { font-size: 13px; margin-top: 8px; text-align: center; }
+#srcNote.bad { color: var(--bad); }
+#srcNote.good { color: var(--text); }
+#srcNote .big { font-size: 15px; font-weight: 600; }
+
+/* Options are always visible. They were behind a collapsed <details>, which
+   hid the one thing on this screen worth reading before pressing the button --
+   and hiding them did not make the screen simpler, it made it look empty. */
+/* -------------------------------------------------------------- exporting */
+
+/* A small text button: an icon needs a legend and a word is its own legend. */
+.act {
+  background: none; border: 0; padding: 0 3px; font: inherit; font-size: 11px;
+  color: var(--dim); cursor: pointer; border-radius: 3px; white-space: nowrap;
+}
+.act:hover { color: var(--text); background: var(--panel2); }
+
+#expNow { font-size: 12px; }
+#expList { display: flex; flex-direction: column; gap: 2px; margin-top: 6px; }
+.expfile {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto auto auto;
+  gap: 8px; align-items: baseline; padding: 2px 0;
+  font-variant-numeric: tabular-nums; font-size: 12px;
+}
+.expfile .nm { overflow-wrap: anywhere; }
+.expfile .sz, .expfile .sp { color: var(--dim); text-align: right; }
+.expfile.bad .nm { color: var(--bad); }
+#expBar { margin: 8px 0 4px; }
+
+/* ---------------------------------------------------------- managing data */
+
+/* One grid for the whole listing, not one per row.
+ *
+ * Every row used to be its own grid, so a `1fr` name column resolved against
+ * that row's own text and the times landed at a different x on every line. A
+ * single grid with `display: contents` rows gives a table's alignment and a
+ * div's event handling. */
+#mgTree {
+  display: grid;
+  grid-template-columns: minmax(10em, 2fr) 4.5em 5.5em minmax(4em, 3fr);
+  align-items: baseline;
+  font-variant-numeric: tabular-nums;
+}
+.mgrow { display: contents; }
+.mgrow > * { padding: 2px 6px; }
+#mgTree .c-time, #mgTree .c-vid { text-align: right; }
+#mgTree .c-tag { color: var(--dim); overflow-wrap: anywhere; }
+
+/* Column headers. */
+.mgrow.mghead > * {
+  color: var(--dim); font-size: 11px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: .04em;
+  border-bottom: 1px solid var(--line); padding-bottom: 3px;
+}
+
+/* Folders: a track, and the events under it. */
+.mgrow.folder > .c-name { grid-column: 1 / -1; cursor: default; }
+.mgrow.folder.track > .c-name { font-weight: 600; padding-top: 7px; }
+.mgrow.folder.event > .c-name { padding-left: 1.6em; }
+.mgrow.folder .meta { color: var(--dim); font-weight: 400; font-size: 12px;
+                      margin-left: 8px; }
+.twist { display: inline-block; width: 1em; color: var(--dim); cursor: pointer; }
+
+.mgrow.lap > * { cursor: default; }
+.mgrow.lap > .c-name { padding-left: 2.6em; }
+.mgrow.lap:hover > * { background: var(--panel2); }
+.mgrow.lap.sel > * { background: #23303f; }
+.mgrow.folder:hover > .c-name { background: var(--panel2); }
+.mgrow.folder.sel > .c-name { background: #23303f; }
+.mgrow.lap.edge > .c-name, .mgrow.lap.edge > .c-time { opacity: .55; }
+.mgrow.lap.best > .c-time { color: var(--good); font-weight: 600; }
+.mgrow .flag { color: var(--warn); font-size: 10px; margin-left: 5px; }
+.mgrow .none { color: var(--dim); }
+
+/* The toolbar is always present, and always in the same place. */
+#mgBar {
+  display: flex; gap: 6px; align-items: center; flex-wrap: wrap;
+  padding: 6px 0 8px;
+}
+#mgBar .ghost.danger:not(:disabled):hover { color: var(--bad);
+                                            border-color: var(--bad); }
+#mgSel { font-size: 12px; margin-left: 4px; }
+#mgHint { font-size: 11px; padding-top: 8px; }
+
+@media (max-width: 54em) {
+  #mgTree { grid-template-columns: minmax(8em, 2fr) 4.5em 5.5em; }
+  #mgTree .c-tag { display: none; }
+}
+
+#impNaming {
+  display: flex; flex-direction: column; gap: 6px;
+  margin: 12px auto 0; max-width: 34rem;
+}
+#impNaming .opt.field > .lbl { flex: 0 0 6em; }
+#impNaming input, #impNaming select { flex: 1 1 auto; }
+#impNaming .bad { color: var(--bad); }
+#impNamingWhy { font-size: 11px; }
+
+#impOptions { margin-top: 12px; border-top: 1px solid var(--line);
+              padding-top: 10px; }
+/* Two columns while they fit, one when they do not. `auto-fit` rather than a
+   media query: what matters is the width these controls need, not the width of
+   the window. */
+.optgrid {
+  display: grid; gap: 14px 28px;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 290px), 1fr));
+}
+.optcol { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.opthead { font-size: 12px; font-weight: 600; color: var(--dim);
+           text-transform: uppercase; letter-spacing: .04em; }
+
+/* One option per row. Without this every label was a plain inline box, so the
+   text, the checkbox and the number field of one option wrapped into the middle
+   of the next one. */
+.opt {
+  display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+  font-size: 13px; line-height: 1.4; min-width: 0;
+}
+.opt.check { cursor: pointer; }
+.opt.check > input[type=checkbox] { accent-color: var(--accent); flex: 0 0 auto; }
+/* The hint belongs under its option, not run onto the end of it. */
+.opt em { flex: 1 0 100%; font-size: 11px; color: var(--dim); font-style: italic; }
+/* A label column wide enough for the longest of them, so the controls line up
+   instead of stepping in and out. */
+.opt.field > .lbl { flex: 0 0 6.5em; color: var(--dim); }
+.opt input[type=number], .opt input[type=text], .opt select {
+  background: var(--bg); border: 1px solid var(--line); border-radius: 4px;
+  color: var(--text); font: inherit; font-size: 12px; padding: 2px 5px;
+  min-width: 0;
+}
+/* Wide enough for four digits and no wider: these were browser-default width,
+   which made "only the quickest [        3        ] per session" read as a
+   text box someone had left in by mistake. */
+.opt input[type=number] { flex: 0 0 4.2em; }
+.opt input[type=text] { flex: 1 1 12em; }
+.opt select { flex: 1 1 auto; max-width: 100%; }
+#impApp .cmprow { justify-content: center; margin-top: 14px; }
+
+.progress {
+  height: 10px; border-radius: 5px; background: var(--panel2);
+  overflow: hidden; margin: 8px 0;
+}
+.progress > i {
+  display: block; height: 100%; width: 0;
+  background: var(--accent); transition: width .25s;
+}
+#impPhase { font-size: 15px; font-weight: 600; }
+
+#revSafe {
+  margin-top: 8px; padding: 8px 10px; border-radius: 6px;
+  background: #14261b; border: 1px solid var(--good); color: var(--good);
+  font-size: 13px;
+}
+#revSafe.bad { background: #2a1616; border-color: var(--bad); color: var(--bad); }
+.revbuttons { display: flex; gap: 6px; align-items: center; }
+#revTracks { align-self: center; width: 100%; max-width: 900px; }
+.revtrack { margin-bottom: 8px; }
+.revtrack canvas { display: block; background: var(--bg);
+                   border-radius: 6px; }
+/* Map beside the laps while both fit, map above them when they do not. Flex
+   rather than a fixed two-column grid: a 260 px map and a five-column table do
+   not fit side by side on a small screen, and the table was the thing that got
+   clipped. */
+.revbody { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-start; }
+.revbody > canvas { flex: 0 0 auto; }
+.revbody > .revlaps { flex: 1 1 300px; min-width: 0; overflow-x: auto; }
+
+/* One column when the window is too narrow for a side panel: the map and lap
+   list are worth keeping, just not beside the video. */
+/* In `em`, so the breakpoint moves with the reader's font size rather than
+   assuming 16 px: someone at 200% zoom gets the single column at the width where
+   two columns actually stop working for them. */
+@media (max-width: 54em) {
+  #stage { grid-template-columns: minmax(0, 1fr); }
+  #lapbar .card.grow { max-height: 40vh; }
+  #cmpTop { grid-template-columns: minmax(0, 1fr); }
+  #cmpLower { grid-template-columns: minmax(0, 1fr); }
+  #videoWrap { max-height: 50vh; }
+}
