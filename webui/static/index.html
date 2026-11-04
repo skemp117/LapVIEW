@@ -21,7 +21,8 @@
 
 <div id="empty" class="pane hidden">
   <p>The library is empty. Import a folder of RaceChrono CSVs and footage:
-    open <strong>library</strong>, choose the folder, and press Import.</p>
+    open <strong>library</strong>, upload the files or choose the folder, and
+    press Import.</p>
 </div>
 
 <main id="app" class="hidden">
@@ -179,17 +180,46 @@
       <div id="expBar" class="progress hidden"><i id="expFill"></i></div>
       <div id="expNow" class="muted"></div>
       <div id="expList"></div>
+      <div id="expSaved"></div>
     </div>
   </section>
 
   <!-- step 1: choose a folder -->
   <section id="impChoose">
+    <!-- or send the files up first: from a phone there is no folder to point
+         at, so the files come to the server and the folder is made there -->
+    <div class="card wide" id="upCard">
+      <div class="cardhead">upload <span id="upMeta" class="muted"></span></div>
+      <div id="upDrop">
+        <strong>Send files from this device</strong>
+        <span class="muted">RaceChrono CSVs and the footage that goes with
+          them. They land in a new folder on the server, ready to import.</span>
+        <div class="uprow">
+          <input type="text" id="upName" autocomplete="off"
+                 placeholder="name this upload (optional)">
+          <label class="btn primary big" for="upFiles">Choose files…</label>
+        </div>
+        <input type="file" id="upFiles" class="vh" multiple
+               accept="video/*,.csv,text/csv,.mov,.mp4,.m4v,.mkv,.avi,.insv,.lrv">
+        <input type="file" id="upFilesAny" class="vh" multiple>
+        <span class="muted small">Keep this page open and the screen on until
+          it says done. A camera file greyed out in the picker?
+          <label class="act" for="upFilesAny">choose any file type</label></span>
+      </div>
+      <div id="upList"></div>
+      <div class="cmprow hidden" id="upDone">
+        <button id="upImport" class="primary big">Import this upload</button>
+        <button id="upMore" class="ghost">start another upload</button>
+      </div>
+      <div id="upFolders"></div>
+    </div>
+
     <div class="card wide">
       <div class="cardhead">import</div>
       <div id="drop">
-        <strong>Drop a folder here</strong>
-        <span class="muted">or choose one — nothing is copied and nothing is
-          deleted; the folder is read where it sits</span>
+        <strong id="dropTitle">Drop a folder here</strong>
+        <span class="muted" id="dropWhy">or choose one — nothing is copied and
+          nothing is deleted; the folder is read where it sits</span>
         <button id="srcBrowse" class="primary big">Choose folder…</button>
         <input type="text" id="srcPath" placeholder="…or paste a path">
       </div>

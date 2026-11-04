@@ -16,6 +16,7 @@ venv/
 library/
 cache/
 Output/
+inbox/
 
 # Older library location (library.db + laps/ + tracks/)
 Laps/

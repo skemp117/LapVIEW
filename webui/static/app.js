@@ -19,6 +19,10 @@ const API = {
                           .then(r => r.json()),
 };
 
+/* Where the page is running, from /api/config. `headless` is a server: no
+ * folder chooser, no "show in folder", downloads instead. */
+const CFG = { headless: false, inbox_dir: '', upload: null };
+
 /* The lap sidebar's own scratch: which event folders are shut, the row order
  * (for shift-click ranges) and the debounce timer for the comparison. */
 const LB = { shut: new Set(), rows: [], timer: null, lastTick: null };
@@ -1730,7 +1734,10 @@ async function exportLaps(ids, opts) {
                + (preview ? '\n\nFirst ' + preview + ' s of each, as a check.'
                           : '\n\n' + fmtTime(offer.seconds) + ' of video — '
                             + 'roughly ' + mins + ' minute(s) of rendering.')
-               + '\n\nInto ' + offer.out_dir)) return;
+               + (CFG.headless
+                 ? '\n\nEach file gets a download link under exports in the '
+                   + 'library tab when it is done.'
+                 : '\n\nInto ' + offer.out_dir))) return;
   const q = new URLSearchParams({ laps: usable.map((l) => l.id).join(',') });
   if (preview) q.set('preview', String(preview));
   if ((opts || {}).overwrite) q.set('overwrite', '1');
@@ -1793,16 +1800,63 @@ function drawExports(job) {
     sp.className = 'sp';
     sp.textContent = f.speed ? f.speed.toFixed(2) + '× realtime' : '';
     row.append(nm, sz, sp);
-    if (f.out && !f.error) {
-      const b = document.createElement('button');
-      b.className = 'act';
-      b.textContent = 'show in folder';
-      b.title = 'open the desktop file browser at this file';
-      b.onclick = () => reveal(f.out);
-      row.appendChild(b);
-    } else {
-      row.appendChild(document.createElement('span'));
-    }
+    row.appendChild(f.out && !f.error ? exportActions(f)
+                                      : document.createElement('span'));
+    box.appendChild(row);
+  }
+  if (!running) refreshExports(files);
+}
+
+/* Download everywhere; "show in folder" only where there is a desktop to show
+ * it on. On a server the file is on someone else's disk. */
+function exportActions(f) {
+  const acts = document.createElement('span');
+  acts.className = 'acts';
+  if (f.url) {
+    const a = document.createElement('a');
+    a.className = 'act';
+    a.href = f.url;
+    a.setAttribute('download', f.name || '');
+    a.textContent = 'download';
+    acts.appendChild(a);
+  }
+  if (!CFG.headless) {
+    const b = document.createElement('button');
+    b.className = 'act';
+    b.textContent = 'show in folder';
+    b.title = 'open the desktop file browser at this file';
+    b.onclick = () => reveal(f.out);
+    acts.appendChild(b);
+  }
+  return acts;
+}
+
+/* Everything already in the export folder, so a file rendered yesterday -- or
+ * from another device -- can still be fetched. */
+async function refreshExports(current) {
+  let d;
+  try {
+    d = await fetch('/api/exports').then((r) => r.json());
+  } catch (e) { return; }
+  const shown = new Set((current || []).map((f) => f.out));
+  const rows = (d.files || []).filter((f) => !shown.has(f.out));
+  const box = $('expSaved');
+  box.innerHTML = '';
+  if (!rows.length) return;
+  const head = document.createElement('div');
+  head.className = 'opthead';
+  head.textContent = 'in the export folder';
+  box.appendChild(head);
+  for (const f of rows) {
+    const row = document.createElement('div');
+    row.className = 'expfile saved';
+    const nm = document.createElement('span');
+    nm.className = 'nm';
+    nm.textContent = f.name;
+    const sz = document.createElement('span');
+    sz.className = 'sz';
+    sz.textContent = human(f.bytes);
+    row.append(nm, sz, exportActions(f));
     box.appendChild(row);
   }
 }
@@ -2313,6 +2367,7 @@ async function refreshImport() {
   }
   buildManage();
   pollExport();
+  refreshInbox();
   if (job.state === 'running') { impStep('working'); return pollImport(); }
   const finished = job.state === 'done' || job.state === 'unverified';
   if (finished && !S.impDone) return showReview();
@@ -2695,6 +2750,9 @@ $('optVideo').addEventListener('change', syncImportReady);
    * chooser, which does know where things are. */
   zone.addEventListener('drop', (e) => {
     const files = [...((e.dataTransfer && e.dataTransfer.files) || [])];
+    /* On a server a dropped file has nowhere to be read from but here, so it
+     * is uploaded, the same as one dropped on the upload card. */
+    if (CFG.headless && files.length) return uploadFiles(files);
     const rel = files.map((f) => f.webkitRelativePath || '').filter(Boolean);
     const folder = rel.length ? rel[0].split('/')[0] : '';
     const note = $('srcNote');
@@ -2709,13 +2767,395 @@ $('optVideo').addEventListener('change', syncImportReady);
   });
 }
 
+/* ================================================================ uploading
+ *
+ * From a phone there is no folder to point at, so the files come to the server
+ * first, into a new folder of their own, and that folder is then imported like
+ * any other.
+ *
+ * Each file goes up in slices (Blob.slice), each sent with the offset it
+ * belongs at; the server writes it there and keeps a note of which ranges it
+ * has, so nothing is held in memory at either end. A slice that fails is sent
+ * again with a growing pause -- a phone's link drops for seconds at a time --
+ * and a file that still fails can be retried: starting it again returns what
+ * already arrived, and only the gaps are sent. Nothing appears in the upload
+ * folder until every byte of a file is there.
+ */
+
+const UP = {
+  folder: null,     // {folder, path}: where this batch is going
+  label: '',
+  rows: [],         // one per file: {file, el, state, received, id, error}
+  running: false,
+  wake: null,
+  free: null,
+};
+
+async function upPost(path, body, binary) {
+  const r = await fetch(path, {
+    method: 'POST',
+    headers: { 'X-LapVIEW': '1',
+               'Content-Type': binary ? 'application/octet-stream'
+                                      : 'application/json' },
+    body: binary ? body : JSON.stringify(body || {}),
+  });
+  let d = {};
+  try { d = await r.json(); } catch (e) { d = {}; }
+  if (!r.ok || d.error) {
+    const err = new Error(d.error || ('HTTP ' + r.status));
+    err.status = r.status;
+    throw err;
+  }
+  return d;
+}
+
+function upAccepts(file) {
+  const exts = (CFG.upload && CFG.upload.extensions) ||
+    ['.avi', '.csv', '.insv', '.lrv', '.m4v', '.mkv', '.mov', '.mp4'];
+  const i = file.name.lastIndexOf('.');
+  return i > 0 && exts.includes(file.name.slice(i).toLowerCase());
+}
+
+async function uploadFiles(list) {
+  const files = [...list];
+  if (!files.length) return;
+  if (!UP.folder) {
+    UP.label = $('upName').value.trim();
+    try {
+      UP.folder = await upPost('/api/upload/folder', { name: UP.label });
+    } catch (e) {
+      $('upMeta').textContent = 'could not start an upload: ' + e.message;
+      return;
+    }
+  }
+  $('upName').disabled = true;
+  $('upDone').classList.add('hidden');
+  for (const f of files) {
+    const ok = upAccepts(f);
+    const row = { file: f, state: ok ? 'queued' : 'skipped', received: 0,
+                  id: null, error: ok ? '' : 'not a CSV or a video', note: '' };
+    row.el = upRowEl();
+    UP.rows.push(row);
+    upPaint(row);
+  }
+  upPump();
+}
+
+async function upPump() {
+  if (UP.running) return;
+  UP.running = true;
+  upWake(true);
+  try {
+    for (;;) {
+      const row = UP.rows.find((r) => r.state === 'queued');
+      if (!row) break;
+      await upOne(row);
+    }
+  } finally {
+    UP.running = false;
+    upWake(false);
+    upFinished();
+  }
+}
+
+async function upOne(row) {
+  const f = row.file;
+  row.state = 'sending';
+  row.error = '';
+  row.t0 = performance.now();
+  row.b0 = row.received;
+  upPaint(row);
+  try {
+    const b = await upRetry(() => upPost('/api/upload/begin', {
+      folder: UP.folder.folder, name: f.name, size: f.size }), row);
+    if (b.done) {
+      row.received = f.size;
+      row.state = 'done';
+      row.note = 'already there';
+      return;
+    }
+    row.id = b.id;
+    row.received = row.b0 = b.received;
+    row.t0 = performance.now();
+    const chunk = b.chunk || (8 << 20);
+    let ranges = b.ranges || [];
+    for (let off = 0; off < f.size; off += chunk) {
+      const end = Math.min(f.size, off + chunk);
+      if (ranges.some(([a, z]) => a <= off && z >= end)) continue;
+      const d = await upRetry(() => upPost(
+        '/api/upload/chunk?id=' + row.id + '&offset=' + off,
+        f.slice(off, end), true), row);
+      ranges = d.ranges;
+      row.received = d.received;
+      upPaint(row);
+    }
+    const fin = await upRetry(() => upPost('/api/upload/finish',
+                                           { id: row.id }), row);
+    row.state = 'done';
+    row.received = f.size;
+    row.savedAs = fin.name;
+  } catch (e) {
+    row.state = 'failed';
+    row.error = e.message || String(e);
+  } finally {
+    upPaint(row);
+  }
+}
+
+/* Network errors and server errors are retried with a growing pause. A
+ * refusal (4xx, or 507 for a full disk) is not: sending it again would get the
+ * same answer. */
+async function upRetry(fn, row) {
+  const waits = [1, 2, 4, 8, 15, 30];
+  for (let i = 0; ; i++) {
+    try {
+      return await fn();
+    } catch (e) {
+      const refused = (e.status >= 400 && e.status < 500 &&
+                       e.status !== 408 && e.status !== 429) ||
+                      e.status === 507;
+      if (refused || i >= waits.length) throw e;
+      row.note = 'retrying in ' + waits[i] + ' s — ' + (e.message || e);
+      upPaint(row);
+      await new Promise((res) => setTimeout(res, waits[i] * 1000));
+      row.note = '';
+    }
+  }
+}
+
+function upRowEl() {
+  const el = document.createElement('div');
+  el.className = 'upfile';
+  el.innerHTML = '<span class="nm"></span><span class="st"></span>' +
+                 '<div class="progress"><i></i></div>';
+  $('upList').appendChild(el);
+  return el;
+}
+
+function fmtLeft(s) {
+  if (!isFinite(s)) return '';
+  if (s < 90) return Math.max(1, Math.round(s)) + ' s left';
+  if (s < 5400) return Math.round(s / 60) + ' min left';
+  return Math.floor(s / 3600) + ' h ' + Math.round((s % 3600) / 60) +
+         ' min left';
+}
+
+function upPaint(row) {
+  const el = row.el;
+  const f = row.file;
+  el.classList.toggle('done', row.state === 'done');
+  el.classList.toggle('bad', row.state === 'failed' || row.state === 'skipped');
+  el.querySelector('.nm').textContent = f.name +
+    (row.savedAs && row.savedAs !== f.name ? '  →  ' + row.savedAs : '');
+  el.querySelector('.progress > i').style.width =
+    (f.size ? Math.round(100 * row.received / f.size) : 100) + '%';
+  let text;
+  if (row.state === 'skipped') text = 'skipped — ' + row.error;
+  else if (row.state === 'failed') text = 'stopped at ' + human(row.received) +
+                                          ' — ' + row.error + ' ';
+  else if (row.state === 'done') text = human(f.size) + ' — ' +
+                                        (row.note || 'done');
+  else if (row.state === 'queued') text = human(f.size) + ' — waiting';
+  else {
+    const secs = (performance.now() - row.t0) / 1000;
+    const rate = secs > 2 ? (row.received - row.b0) / secs : 0;
+    text = human(row.received) + ' of ' + human(f.size);
+    if (rate > 0) text += '  ·  ' + human(rate) + '/s  ·  ' +
+                          fmtLeft((f.size - row.received) / rate);
+    if (row.note) text += '  ·  ' + row.note;
+  }
+  const st = el.querySelector('.st');
+  st.textContent = text;
+  if (row.state === 'failed') {
+    const again = document.createElement('button');
+    again.className = 'act';
+    again.textContent = 'retry';
+    again.onclick = () => {
+      row.state = 'queued';
+      upPaint(row);
+      upPump();
+    };
+    st.appendChild(again);
+  }
+  upSummary();
+}
+
+function upSummary() {
+  const rows = UP.rows.filter((r) => r.state !== 'skipped');
+  const free = UP.free !== null ? human(UP.free) + ' free on the server' : '';
+  if (!rows.length) { $('upMeta').textContent = free; return; }
+  const done = rows.filter((r) => r.state === 'done').length;
+  const total = rows.reduce((s, r) => s + r.file.size, 0);
+  const sent = rows.reduce((s, r) => s + r.received, 0);
+  $('upMeta').textContent = done + ' of ' + rows.length + ' file(s)  ·  ' +
+    human(sent) + ' of ' + human(total) + '  ·  into ' + UP.folder.folder;
+}
+
+function upFinished() {
+  const rows = UP.rows.filter((r) => r.state !== 'skipped');
+  const ok = rows.length && rows.every((r) => r.state === 'done');
+  $('upDone').classList.toggle('hidden', !ok);
+  refreshInbox();
+}
+
+/* Safari on a phone stops a page's network traffic when the screen locks. A
+ * wake lock keeps the screen on while files are going up; the browser drops it
+ * when the page is hidden, so it is taken again on return. */
+async function upWake(on) {
+  try {
+    if (on && !UP.wake && navigator.wakeLock) {
+      UP.wake = await navigator.wakeLock.request('screen');
+    } else if (!on && UP.wake) {
+      const w = UP.wake;
+      UP.wake = null;
+      await w.release();
+    }
+  } catch (e) {
+    UP.wake = null;
+  }
+}
+
+function importFolder(path) {
+  if (!$('optEvent').value.trim() && UP.label) $('optEvent').value = UP.label;
+  useSource(path).then(() => {
+    $('impNaming').scrollIntoView({ behavior: 'smooth', block: 'center' });
+    if (!$('optEvent').value.trim()) $('optEvent').focus();
+  });
+}
+
+/* Earlier uploads: import one, or delete it once its laps are in the library.
+ * On a server nobody can clear the inbox by hand without a shell. */
+async function refreshInbox() {
+  let d;
+  try {
+    d = await fetch('/api/inbox').then((r) => r.json());
+  } catch (e) { return; }
+  UP.free = d.free_bytes === undefined ? null : d.free_bytes;
+  upSummary();
+  const box = $('upFolders');
+  box.innerHTML = '';
+  const rows = d.folders || [];
+  if (!rows.length) return;
+  const head = document.createElement('div');
+  head.className = 'opthead';
+  head.textContent = 'uploads on the server';
+  box.appendChild(head);
+  for (const f of rows) {
+    const row = document.createElement('div');
+    row.className = 'upfolder';
+    const nm = document.createElement('span');
+    nm.className = 'nm';
+    nm.textContent = f.folder + (f.partial ? '  (' + f.partial +
+                                 ' unfinished)' : '');
+    const sz = document.createElement('span');
+    sz.className = 'sz';
+    sz.textContent = f.csvs + ' csv  ·  ' + f.videos + ' video  ·  ' +
+                     human(f.bytes);
+    const acts = document.createElement('span');
+    acts.className = 'acts';
+    const imp = document.createElement('button');
+    imp.className = 'act';
+    imp.textContent = 'import';
+    imp.disabled = !f.csvs;
+    imp.onclick = () => importFolder(f.path);
+    const del = document.createElement('button');
+    del.className = 'act';
+    del.textContent = 'delete';
+    del.disabled = UP.running && UP.folder && UP.folder.folder === f.folder;
+    del.onclick = async () => {
+      if (!confirm('Delete the upload "' + f.folder + '"?\n\nIts ' +
+                   (f.csvs + f.videos) + ' file(s), ' + human(f.bytes) +
+                   ', are removed from the server. Laps already imported ' +
+                   'from it stay in the library.')) return;
+      try {
+        await upPost('/api/inbox/delete', { folder: f.folder });
+      } catch (e) {
+        impStatus(e.message);
+      }
+      if (UP.folder && UP.folder.folder === f.folder) resetUpload();
+      refreshInbox();
+    };
+    acts.append(imp, del);
+    row.append(nm, sz, acts);
+    box.appendChild(row);
+  }
+}
+
+function resetUpload() {
+  if (UP.running) return;
+  UP.folder = null;
+  UP.label = '';
+  UP.rows = [];
+  $('upList').innerHTML = '';
+  $('upDone').classList.add('hidden');
+  $('upName').disabled = false;
+  $('upName').value = '';
+  upSummary();
+}
+
+for (const id of ['upFiles', 'upFilesAny']) {
+  $(id).addEventListener('change', (e) => {
+    const files = [...e.target.files];
+    e.target.value = '';
+    uploadFiles(files);
+  });
+}
+$('upImport').onclick = () => { if (UP.folder) importFolder(UP.folder.path); };
+$('upMore').onclick = resetUpload;
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && UP.running) {
+    UP.wake = null;
+    upWake(true);
+  }
+});
+window.addEventListener('beforeunload', (e) => {
+  if (!UP.running) return;
+  e.preventDefault();
+  e.returnValue = '';
+});
+{
+  const zone = $('upDrop');
+  const stop = (e) => { e.preventDefault(); e.stopPropagation(); };
+  for (const t of ['dragenter', 'dragover']) {
+    zone.addEventListener(t, (e) => { stop(e); zone.classList.add('over'); });
+  }
+  for (const t of ['dragleave', 'drop']) {
+    zone.addEventListener(t, (e) => { stop(e); zone.classList.remove('over'); });
+  }
+  zone.addEventListener('drop', (e) => {
+    uploadFiles((e.dataTransfer && e.dataTransfer.files) || []);
+  });
+}
+
+/* A server has no desktop: no folder chooser, and the import box reads
+ * folders under the inbox rather than anywhere on a disk. */
+function applyServerMode() {
+  if (!CFG.headless) return;
+  $('srcBrowse').classList.add('hidden');
+  $('dropTitle').textContent = 'Import a folder on the server';
+  $('dropWhy').textContent = 'an upload from above, or a folder under ' +
+    CFG.inbox_dir + ' — type its name or full path. Files dropped here are ' +
+    'uploaded.';
+  $('srcPath').placeholder = 'an upload, e.g. 2026-11-03_141502';
+}
+
+async function loadConfig() {
+  try {
+    Object.assign(CFG, await fetch('/api/config').then((r) => r.json()));
+  } catch (e) { /* a desktop default is a safe one */ }
+  applyServerMode();
+}
+
 requestAnimationFrame(tick);
 /* The hash names the screen, so a reload keeps it and a link can point at one:
  * `#library` for the library tab, `#compare` for the laps tab with a comparison
  * already up. */
 const WANT = (window.location && window.location.hash || '').replace('#', '');
-if (WANT === 'library' || WANT === 'import') setMode('import');
-loadLibrary()
+loadConfig()
+  .then(() => {
+    if (WANT === 'library' || WANT === 'import') setMode('import');
+    return loadLibrary();
+  })
   .then(() => {
     if (WANT !== 'compare' || !S.lap) return;
     preselect();

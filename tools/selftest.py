@@ -3558,6 +3558,263 @@ def t_reset_answers_after_wiping():
         return "3 laps cleared, the reset answered, the worker's cleanup runs"
 
 
+def _refused(fn, *a, code=None):
+    """fn(*a) must raise UploadError (with this status, if given)."""
+    from webui import uploads
+    try:
+        fn(*a)
+    except uploads.UploadError as exc:
+        assert code is None or exc.code == code, (a, exc.code, exc)
+        return exc
+    raise AssertionError("%s%r was accepted" % (fn.__name__, a))
+
+
+def t_upload_names_are_checked():
+    """A name from a browser is data, never a path."""
+    from webui import uploads
+    ok = {"IMG_1234.MOV": "IMG_1234.MOV", "  GH010234.MP4 ": "GH010234.MP4",
+          "session_20260819_165433 amp.csv": "session_20260819_165433 amp.csv",
+          "VID_20261103.insv": "VID_20261103.insv", 'a<b>:c.mp4': "a_b__c.mp4"}
+    for name, want in ok.items():
+        assert uploads.safe_filename(name) == want, name
+    bad = ["../x.mp4", "a/b.mp4", "a\\b.mp4", "/etc/passwd.csv",
+           "C:\\x\\y.csv", ".hidden.mp4", "..", "x..mp4", "", "   ",
+           "x.exe", "x.csv.exe", "noext", "x.mp4\x00.csv", "x\n.mp4",
+           "CON.mp4", "nul.csv", "a" * 250 + ".mp4", None, 7]
+    for name in bad:
+        _refused(uploads.safe_filename, name)
+    _refused(uploads.safe_filename, "x.exe", code=415)
+    assert uploads.safe_label("../../etc") == "etc"
+    assert ".." not in uploads.safe_label("a..b/../c")
+    with tempfile.TemporaryDirectory() as tmp:
+        inbox = uploads.Inbox(Path(tmp) / "inbox").ensure()
+        (Path(tmp) / "outside").mkdir()
+        for folder in ("..", "../outside", "/etc", "C:\\Windows", ".partial",
+                       "a/b", "", None):
+            _refused(inbox.folder, folder)
+        _refused(inbox.folder, "missing", code=404)
+        _refused(inbox.begin, "..", "x.csv", 10)
+    return "%d names accepted, %d refused; 8 folder names refused" % (
+        len(ok), len(bad))
+
+
+def t_chunked_upload_assembles():
+    """Chunks out of order, a retried chunk and a dropped one still make the file.
+
+    The phone's link is the unreliable part. Whatever order the chunks land in,
+    however often one is resent, the file that reaches the folder is the file
+    that was sent -- and until then it is not in the folder at all.
+    """
+    import io
+    import os
+    from webui import uploads
+    MB = 1 << 20
+    data = os.urandom(2 * MB + MB // 2)
+    chunks = [(0, MB), (MB, 2 * MB), (2 * MB, len(data))]
+    with tempfile.TemporaryDirectory() as tmp:
+        inbox = uploads.Inbox(Path(tmp) / "inbox").ensure()
+        made = inbox.new_folder("Grip 8/22 ..")
+        folder = made["folder"]
+        assert "/" not in folder and ".." not in folder, folder
+        start = inbox.begin(folder, "clip.MP4", len(data))
+        uid = start["id"]
+        assert start["received"] == 0 and not start["done"]
+
+        def send(i, payload=None):
+            lo, hi = chunks[i]
+            body = data[lo:hi] if payload is None else payload
+            return inbox.write(uid, lo, hi - lo, io.BytesIO(body))
+
+        send(2)                                    # out of order
+        send(0)
+        send(0)                                    # the retry of a chunk
+        assert not (Path(made["path"]) / "clip.MP4").exists(), \
+            "a partial file is visible in the upload folder"
+        exc = _refused(inbox.finish, uid, code=409)
+        assert "missing" in str(exc), exc
+        again = inbox.begin(folder, "clip.MP4", len(data))
+        assert again["id"] == uid and again["received"] == MB + MB // 2, \
+            again                  # chunks 0 and 2: 1.5 MB
+        _refused(send, 1, data[MB:MB + 1000])      # the link dropped mid-chunk
+        assert inbox.status(uid)["received"] == again["received"]
+        send(1)
+        done = inbox.finish(uid)
+        got = Path(done["path"])
+        assert got.read_bytes() == data, "the assembled file differs"
+        assert got.parent == Path(made["path"]).resolve()
+        assert not list((Path(tmp) / "inbox" / uploads.PARTIAL).iterdir())
+
+        # The same file again is already there; a different one of the same
+        # name sits beside it rather than over it.
+        assert inbox.begin(folder, "clip.MP4", len(data))["done"]
+        other = inbox.begin(folder, "clip.MP4", 10)
+        inbox.write(other["id"], 0, 10, io.BytesIO(b"0123456789"))
+        assert Path(inbox.finish(other["id"])["path"]).name == "clip (2).MP4"
+
+        last = inbox.begin(folder, "run.csv", 100)
+        _refused(inbox.write, last["id"], 90, 20, io.BytesIO(b"x" * 20),
+                 code=416)
+        _refused(inbox.check_chunk, last["id"], 0, uploads.MAX_CHUNK + 1,
+                 code=413)
+        _refused(inbox.check_chunk, last["id"], -1, 10)
+        _refused(inbox.write, "../../etc/passwd", 0, 1, io.BytesIO(b"x"))
+        _refused(inbox.begin, folder, "empty.csv", 0)
+        _refused(uploads.Inbox(Path(tmp) / "inbox", max_file=1000).begin,
+                 folder, "big.mp4", 1001, code=413)
+        inbox.abort(last["id"])
+        _refused(inbox.status, last["id"], code=404)
+
+        listed = inbox.folders()
+        assert [f["folder"] for f in listed] == [folder], listed
+        assert listed[0]["videos"] == 2 and listed[0]["bytes"] == len(data) + 10
+        inbox.delete_folder(folder)
+        assert inbox.folders() == []
+        assert sorted(p.name for p in Path(tmp).iterdir()) == ["inbox"], \
+            "something was written outside the inbox"
+    return ("3 chunks out of order with a retry and a dropped one: identical; "
+            "partials never visible; duplicates kept apart")
+
+
+def t_server_uploads_and_downloads():
+    """The routes, over a real socket, in server mode.
+
+    Upload a fixture CSV in chunks out of order; check the inbox lists it; check
+    the browser cannot look outside the data folders; download an export with
+    and without a range; and try the usual ways out of the export folder.
+    """
+    import http.client
+    import json as json_mod
+    from http.server import ThreadingHTTPServer
+    from urllib.parse import quote
+    from webui import server as srv_mod
+    src = SOURCE / "circuit_5laps.csv"
+    data = src.read_bytes()
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _server_library(tmp, headless=True)
+        app.inbox.ensure()
+        (Path(tmp) / "secret.txt").write_text("not yours")
+        out = Path(tmp) / "out"
+        out.mkdir()
+        export = out / "AMP lap 3 \u00fc.mp4"
+        export.write_bytes(bytes(range(256)) * 8)
+
+        class H(srv_mod.Handler):
+            library = app
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        srv.verbose = False
+        srv.headless = True
+        # Each request thread opens its own sqlite connection, released when
+        # the thread ends. `server_close` waits for non-daemon threads, so the
+        # library file is free again before the directory is removed.
+        srv.daemon_threads = False
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        conn = http.client.HTTPConnection("127.0.0.1", srv.server_address[1],
+                                          timeout=30)
+
+        def call(method, path, body=None, headers=None, raw=False):
+            h = {"X-LapVIEW": "1"} if method == "POST" else {}
+            h.update(headers or {})
+            if isinstance(body, dict):
+                body = json_mod.dumps(body).encode()
+                h["Content-Type"] = "application/json"
+            conn.request(method, path, body=body, headers=h)
+            r = conn.getresponse()
+            payload = r.read()
+            if r.getheader("Connection", "").lower() == "close":
+                conn.close()
+            return r, (payload if raw else json_mod.loads(payload or b"{}"))
+
+        try:
+            r, _ = call("POST", "/api/upload/folder", {"name": "x"},
+                        headers={"X-LapVIEW": "0"})
+            assert r.status == 403, "a POST without the header was accepted"
+            r, f = call("POST", "/api/upload/folder", {"name": "amp"})
+            assert r.status == 200, f
+            r, b = call("POST", "/api/upload/begin",
+                        {"folder": f["folder"], "name": src.name,
+                         "size": len(data)})
+            assert r.status == 200 and b["chunk"] > 0, b
+            step = 1 << 20
+            offsets = list(range(0, len(data), step))
+            for off in offsets[1:] + offsets[:1] + offsets[:1]:
+                r, got = call("POST", "/api/upload/chunk?id=%s&offset=%d"
+                              % (b["id"], off), data[off:off + step],
+                              {"Content-Type": "application/octet-stream"})
+                assert r.status == 200, got
+            r, bad = call("POST", "/api/upload/chunk?id=%s&offset=%d"
+                          % (b["id"], len(data)), b"xx")
+            assert r.status == 416, bad
+            r, fin = call("POST", "/api/upload/finish", {"id": b["id"]})
+            assert r.status == 200, fin
+            assert Path(fin["path"]).read_bytes() == data
+            r, inbox = call("GET", "/api/inbox")
+            assert inbox["folders"][0]["csvs"] == 1, inbox
+            r, sv = call("GET", "/api/survey?path=" + quote(f["folder"]))
+            assert r.status == 200 and sv["csvs"] == 1, sv
+
+            for where in (tmp, str(Path(tmp) / "inbox" / ".."), "/",
+                          str(Path.home())):
+                r, _ = call("GET", "/api/browse?path=" + quote(where))
+                assert r.status == 403, "browse reached %s" % where
+                r, _ = call("GET", "/api/survey?path=" + quote(where))
+                assert r.status == 403, "survey reached %s" % where
+            r, br = call("GET", "/api/browse")
+            assert Path(br["path"]) == app.inbox_dir() and br["parent"] == ""
+            r, _ = call("GET", "/api/reveal?path=" + quote(str(export)))
+            assert r.status == 400, "reveal ran on a server"
+            r, pick = call("GET", "/api/pick")
+            assert pick.get("headless") and pick.get("error"), pick
+
+            r, ex = call("GET", "/api/exports")
+            url = ex["files"][0]["url"]
+            r, body = call("GET", url, raw=True)
+            assert r.status == 200 and body == export.read_bytes()
+            disp = r.getheader("Content-Disposition")
+            assert disp.startswith("attachment;") and "UTF-8''" in disp, disp
+            r, body = call("GET", url, headers={"Range": "bytes=10-19"}, raw=True)
+            assert r.status == 206 and body == export.read_bytes()[10:20]
+            assert r.getheader("Content-Range") == "bytes 10-19/2048"
+            r, _ = call("GET", url, headers={"Range": "bytes=5000-"}, raw=True)
+            assert r.status == 416
+            for evil in ("/download/../secret.txt", "/download/..%2Fsecret.txt",
+                         "/download/%2e%2e/secret.txt",
+                         "/download/" + quote(str(Path(tmp) / "secret.txt")),
+                         "/download//etc/passwd", "/download/",
+                         "/download/..%5Csecret.txt"):
+                r, body = call("GET", evil, raw=True)
+                assert r.status == 404 and b"not yours" not in body, evil
+
+            r, health = call("GET", "/api/health")
+            assert all(d["writable"] for d in health["dirs"].values()), health
+            assert r.status == (200 if health["ffmpeg"]["ffmpeg"] else 503)
+            r, gone = call("POST", "/api/inbox/delete", {"folder": "../out"})
+            assert r.status == 400 and export.exists(), gone
+            r, gone = call("POST", "/api/inbox/delete", {"folder": f["folder"]})
+            assert r.status == 200 and not Path(fin["path"]).exists(), gone
+        finally:
+            conn.close()
+            srv.shutdown()
+            srv.server_close()
+            app.close()
+            import gc
+            gc.collect()
+    return ("%d chunks out of order, retried; browse/survey refused 4 ways; "
+            "download ranged; 7 traversal attempts 404" % len(offsets))
+
+
+def t_headless_is_decided():
+    from webui import server as srv_mod
+    hd = srv_mod.headless_default
+    assert hd({}, platform="win32") is False
+    assert hd({"DISPLAY": ":0"}, platform="linux") is False
+    assert hd({}, platform="linux") is True
+    assert hd({"LAPVIEW_DATA_DIR": "/data"}, platform="win32") is True
+    assert hd({"LAPVIEW_HEADLESS": "0", "LAPVIEW_DATA_DIR": "/data"},
+              platform="linux") is False
+    assert hd({"LAPVIEW_HEADLESS": "1"}, platform="win32") is True
+    return "desktop on Windows; server on display-less Linux or with a data dir"
+
+
 def main():
     if "--list" in sys.argv:
         _WANTED.append("--none--")       # matches no area: names only
@@ -3689,6 +3946,11 @@ def main():
     check("the gauge font has a named fallback", t_font_has_a_named_fallback)
     area("web server")
     check("a reset answers after wiping", t_reset_answers_after_wiping)
+    check("server mode is decided sensibly", t_headless_is_decided)
+    check("upload names are checked", t_upload_names_are_checked)
+    check("chunked upload assembles", t_chunked_upload_assembles)
+    check("uploads, browsing and downloads over HTTP",
+          t_server_uploads_and_downloads)
 
     print()
     if _TIMING:

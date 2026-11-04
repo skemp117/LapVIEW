@@ -32,6 +32,21 @@ Routes
     GET  /api/import/run?...            start it on a worker thread
     GET  /api/import/progress           how the running import is going
     GET  /api/library/reset?confirm=yes empty the library
+    GET  /api/config                    paths, server mode, upload limits
+    GET  /api/health                    ffmpeg, encoder, writable data dirs
+    GET  /api/exports                   files in the export folder
+    GET  /download/<name>               one of them, as an attachment, ranged
+    GET  /api/inbox                     upload folders and what they hold
+    GET  /api/upload/status?id=         how much of an upload has arrived
+    POST /api/upload/folder             {name}: a new inbox folder
+    POST /api/upload/begin              {folder, name, size}: start or resume
+    POST /api/upload/chunk?id=&offset=  raw bytes, written at that offset
+    POST /api/upload/finish             {id}: check it is whole, move it in
+    POST /api/upload/abort              {id}: forget a partial upload
+    POST /api/inbox/delete              {folder}: remove an upload folder
+
+Every POST needs an `X-LapVIEW: 1` header (see `do_POST`). Uploads are in
+`webui/uploads.py`.
 
 Why stdlib only: this has to run for someone who unzipped a folder and typed one
 command. A build step, a package manager or a framework is a support burden
@@ -49,15 +64,18 @@ import argparse
 import json
 import mimetypes
 import os
+import shutil
 import subprocess
 import struct
 import sys
+import tempfile
 import threading
 import time
+import traceback
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -69,8 +87,28 @@ import numpy as np                                                # noqa: E402
 from racechrono import (compare as compare_mod, csv_io,           # noqa: E402
                         library as library_mod, render, video, window)
 from webui import session as session_mod                          # noqa: E402
+from webui import uploads as uploads_mod                          # noqa: E402
 
 STATIC = Path(__file__).resolve().parent / "static"
+
+
+def headless_default(environ=None, platform=None):
+    """Whether this is a server rather than someone's desktop.
+
+    LAPVIEW_HEADLESS decides when it is set. Otherwise a data dir in the
+    environment means a container, and Linux with no display means a server;
+    either way there is no desktop to open a folder chooser or a file browser
+    on, and the filesystem is not the browser's to wander.
+    """
+    env = os.environ if environ is None else environ
+    v = str(env.get("LAPVIEW_HEADLESS") or "").strip()
+    if v:
+        return config_mod.env_flag(v, "LAPVIEW_HEADLESS")
+    if str(env.get("LAPVIEW_DATA_DIR") or "").strip():
+        return True
+    plat = platform or sys.platform
+    return plat.startswith("linux") and not (env.get("DISPLAY")
+                                             or env.get("WAYLAND_DISPLAY"))
 
 
 class Library:
@@ -91,8 +129,15 @@ class Library:
     lock.
     """
 
-    def __init__(self, cfg):
+    def __init__(self, cfg, headless=False, browse_roots=()):
         self.cfg = cfg
+        # Server mode: no desktop integrations, and browsing and importing
+        # confined to the data folders (`roots`) instead of the whole disk.
+        self.headless = bool(headless)
+        self.extra_roots = [Path(p).expanduser().resolve()
+                            for p in browse_roots if str(p).strip()]
+        self.encoder = None          # what encoders.resolve settled on
+        self.inbox = uploads_mod.Inbox(self.inbox_dir())
         self._lock = threading.RLock()
         self._db = None
         self._runs = {}              # lap id -> loaded Run
@@ -111,6 +156,54 @@ class Library:
         self._telemetry = {}
 
     # ---------------------------------------------------------------- basics
+    #
+    # Relative directories are read against the code, as they always were; the
+    # environment makes them absolute, which `ROOT / p` leaves alone.
+    def lib_dir(self):
+        return (ROOT / self.cfg.library_dir).resolve()
+
+    def out_dir(self):
+        return (ROOT / self.cfg.output_dir).resolve()
+
+    def inbox_dir(self):
+        return (ROOT / self.cfg.inbox_dir).resolve()
+
+    def cache_dir(self):
+        return Path(self.cfg.cache_dir).resolve()
+
+    def roots(self):
+        """Where a server lets the browser look: the inbox, the library, and
+        any LAPVIEW_BROWSE_ROOTS."""
+        out = []
+        for p in [self.inbox_dir(), self.lib_dir()] + self.extra_roots:
+            if p not in out:
+                out.append(p)
+        return out
+
+    def allowed(self, path):
+        """`path`, resolved, if this server may read it; PermissionError if not.
+
+        On a desktop that is anywhere -- the person at the browser owns the
+        disk. On a server it is the data roots only, and a relative path is
+        read against the inbox, so `2026-11-03_141502` names an upload.
+        Resolving first means `..` and symlinks are judged by where they land.
+        """
+        p = Path(str(path)).expanduser()
+        if self.headless and not p.is_absolute():
+            p = self.inbox_dir() / p
+        try:
+            p = p.resolve()
+        except OSError:
+            pass
+        if not self.headless:
+            return p
+        for root in self.roots():
+            if p == root or root in p.parents:
+                return p
+        raise PermissionError(
+            "%s is outside the folders this server reads (%s)"
+            % (p, ", ".join(str(r) for r in self.roots())))
+
     def library(self):
         with self._lock:
             if self._db is None:
@@ -421,14 +514,27 @@ class Library:
         of footage, and nothing to clean up afterwards.
         """
         from racechrono import ingest as ingest_mod
-        target = Path(path).expanduser() if path else Path.home()
-        try:
-            target = target.resolve()
-        except OSError:
-            pass
+        if self.headless:
+            # A server's disk is not the browser's to walk: the data roots
+            # only, starting at the inbox, and no way up out of them.
+            target = self.allowed(path) if path else self.inbox_dir()
+        else:
+            target = Path(path).expanduser() if path else Path.home()
+            try:
+                target = target.resolve()
+            except OSError:
+                pass
+        up = str(target.parent)
+        if self.headless:
+            try:
+                self.allowed(target.parent)
+                if target in self.roots():
+                    up = ""
+            except PermissionError:
+                up = ""
         if not target.is_dir():
             return {"path": str(target), "exists": False, "entries": [],
-                    "parent": str(target.parent)}
+                    "parent": up, "roots": self.browse_roots()}
         entries = []
         try:
             for child in sorted(target.iterdir()):
@@ -449,11 +555,18 @@ class Library:
                                 **shallow})
         except OSError as exc:
             return {"path": str(target), "exists": True, "entries": [],
-                    "parent": str(target.parent), "error": str(exc)}
+                    "parent": up, "error": str(exc)}
         here = ingest_mod.survey(target)
-        return {"path": str(target), "exists": True, "parent": str(target.parent),
+        return {"path": str(target), "exists": True, "parent": up,
                 "entries": entries, "here": here,
-                "roots": _roots()}
+                "roots": self.browse_roots()}
+
+    def browse_roots(self):
+        if self.headless:
+            names = {self.inbox_dir(): "inbox", self.lib_dir(): "library"}
+            return [{"name": names.get(r, r.name), "path": str(r)}
+                    for r in self.roots()]
+        return _roots()
 
     def import_plan(self, source, options=None):
         """Plan an import of one folder, and cache it.
@@ -478,7 +591,7 @@ class Library:
 
     def import_payload(self, source, options=None):
         """The plan as JSON, for the import screen."""
-        p = self.import_plan(source, options)
+        p = self.import_plan(str(self.allowed(source)), options)
         est = p.estimate()
         tracks = []
         for tp in p.tracks:
@@ -537,7 +650,7 @@ class Library:
     def survey(self, source):
         """What is in a folder, cheaply. No parsing, no probing, no planning."""
         from racechrono import ingest as ingest_mod
-        got = ingest_mod.survey(source)
+        got = ingest_mod.survey(self.allowed(source))
         got["library"] = self.library().summary()
         return got
 
@@ -550,6 +663,7 @@ class Library:
         so the request starts the job and the page asks how it is going.
         """
         from racechrono import ingest as ingest_mod
+        source = str(self.allowed(source))
         with self._lock:
             if self._job and self._job.get("state") == "running":
                 return dict(self._job)
@@ -630,7 +744,7 @@ class Library:
                 "with_video": sum(1 for x in out if x["has_video"]),
                 "seconds": round(sum(x["video_s"] for x in out
                                      if x["has_video"]), 1),
-                "out_dir": str((ROOT / self.cfg.output_dir).resolve())}
+                "out_dir": str(self.out_dir())}
 
     def export_start(self, lap_ids, preview_s=None, overwrite=False):
         """Render on a worker thread; the page asks how it is going.
@@ -671,7 +785,7 @@ class Library:
             try:
                 made = export_mod.export(
                     self.cfg, self.library(), ids,
-                    out_dir=ROOT / self.cfg.output_dir,
+                    out_dir=self.out_dir(),
                     overwrite=overwrite, preview_s=preview_s,
                     on_lap=on_lap, on_frame=on_frame)
                 job["files"] = made
@@ -696,7 +810,105 @@ class Library:
             elapsed = time.time() - job["started"]
             if done > 0.05:
                 job["eta_s"] = round(elapsed * (job["total"] - done) / done, 1)
+        job["files"] = [dict(f, url=self.download_url(f["out"]))
+                        if f.get("out") and not f.get("error") else f
+                        for f in job.get("files", [])]
+        job["headless"] = self.headless
         return job
+
+    # ------------------------------------------------------------ downloads
+    #
+    # An export on a server is a file on someone else's disk. "Show in folder"
+    # cannot help with that; a download link can, and it is the same link on a
+    # phone and on a desktop.
+
+    def download_url(self, path):
+        """`/download/<name>` for a file in the export folder, else None."""
+        try:
+            rel = Path(path).resolve().relative_to(self.out_dir())
+        except (ValueError, OSError):
+            return None
+        return "/download/" + quote(rel.as_posix())
+
+    def export_file(self, rel):
+        """A file in the export folder by its path there; KeyError otherwise.
+
+        Resolved before it is judged, so `..`, an absolute path or a symlink
+        that leads out of the folder is simply not there.
+        """
+        out = self.out_dir()
+        if not rel or "\x00" in rel:
+            raise KeyError(rel)
+        target = (out / rel).resolve()
+        if out not in target.parents or not target.is_file():
+            raise KeyError(rel)
+        return target
+
+    def exports(self):
+        """Everything in the export folder, newest first, with its link."""
+        out = self.out_dir()
+        rows = []
+        if out.is_dir():
+            for p in out.iterdir():
+                if p.is_file() and not p.name.startswith("."):
+                    st = p.stat()
+                    rows.append({"name": p.name, "bytes": st.st_size,
+                                 "mtime": st.st_mtime, "out": str(p),
+                                 "url": self.download_url(p)})
+        rows.sort(key=lambda r: r["mtime"], reverse=True)
+        return {"out_dir": str(out), "files": rows, "headless": self.headless}
+
+    # --------------------------------------------------------------- health
+    def health(self):
+        """(ok, report): ffmpeg found, every data folder writable, the encoder.
+
+        Cheap enough to poll: two PATH lookups (cached), a temporary file in
+        each folder, a count from sqlite.
+        """
+        ff = {}
+        for name in ("ffmpeg", "ffprobe"):
+            try:
+                ff[name] = video.find_binary(name, getattr(self.cfg.ffmpeg, name))
+            except FileNotFoundError:
+                ff[name] = None
+        dirs = {}
+        for key, p in (("library", self.lib_dir()), ("output", self.out_dir()),
+                       ("cache", self.cache_dir()), ("inbox", self.inbox_dir())):
+            dirs[key] = {"path": str(p), "writable": _writable(p)}
+        try:
+            free = shutil.disk_usage(self.inbox_dir()).free
+        except OSError:
+            free = None
+        enc = dict(self.encoder or {"encoder": self.cfg.encode.encoder,
+                                    "tested": False})
+        from racechrono import encoders
+        enc["summary"] = encoders.describe(self.cfg.encode, self.encoder)
+        try:
+            summary = self.library().summary()
+        except Exception as exc:
+            summary = {"error": "%s: %s" % (type(exc).__name__, exc)}
+        ok = (all(ff.values()) and all(d["writable"] for d in dirs.values())
+              and "error" not in summary)
+        return ok, {"ok": ok, "headless": self.headless, "ffmpeg": ff,
+                    "encoder": enc, "dirs": dirs, "free_bytes": free,
+                    "library": summary}
+
+    def client_config(self):
+        """What the page needs to know about where it is running."""
+        from racechrono import encoders
+        return {
+            "library_dir": str(self.cfg.library_dir),
+            "maps_dir": str(self.cfg.maps_dir),
+            "output_dir": str(self.cfg.output_dir),
+            "inbox_dir": str(self.inbox_dir()),
+            "headless": self.headless,
+            "encoder": encoders.describe(self.cfg.encode, self.encoder),
+            "upload": {"chunk": uploads_mod.CHUNK,
+                       "max_chunk": uploads_mod.MAX_CHUNK,
+                       "max_file": self.inbox.max_file,
+                       "extensions": sorted(uploads_mod.ALLOWED_EXTS)},
+            "summary": self.library().summary(),
+        }
 
     def reveal(self, path):
         """Show a finished file in the desktop's own file browser.
@@ -704,8 +916,11 @@ class Library:
         The alternative is printing a path for someone to paste somewhere, which
         is not a control. Nothing is opened outside the export folder.
         """
+        if self.headless:
+            raise ValueError("this server has no desktop to show files on; "
+                             "download the file instead")
         target = Path(path).resolve()
-        out_dir = (ROOT / self.cfg.output_dir).resolve()
+        out_dir = self.out_dir()
         if target != out_dir and out_dir not in target.parents:
             raise ValueError("only files in %s can be revealed" % out_dir)
         if not target.exists():
@@ -885,6 +1100,17 @@ def pick_folder(timeout=600):
 
 
 
+def _writable(path):
+    """Can a file actually be made here? `os.access` lies on bind mounts."""
+    try:
+        Path(path).mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryFile(dir=str(path)):
+            pass
+        return True
+    except OSError:
+        return False
+
+
 def _roots():
     """Somewhere for a folder picker to start.
 
@@ -954,6 +1180,10 @@ class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "LapVIEW"
     library = None
+    # A phone that loses signal mid-chunk would otherwise hold a thread open
+    # forever. Five minutes is far longer than any one read or write should
+    # take, and an idle keep-alive connection is simply reopened.
+    timeout = 300
 
     def log_message(self, fmt, *args):
         if self.server.verbose:
@@ -988,6 +1218,21 @@ class Handler(BaseHTTPRequestHandler):
             return default
         return float(v)
 
+    def _refuse(self, code, msg):
+        """An error after which this connection is not reused.
+
+        A refused upload chunk may still be on its way in; answering and then
+        reading the next request out of the middle of it would be nonsense.
+        """
+        self.close_connection = True
+        self._send(code, json.dumps({"error": msg}),
+                   "application/json; charset=utf-8", {"Connection": "close"})
+
+    def _trace(self):
+        if getattr(self.server, "verbose", False) or \
+                getattr(self.server, "headless", False):
+            traceback.print_exc()
+
     # -- routing ---------------------------------------------------------
     def do_HEAD(self):
         self.do_GET()
@@ -1000,13 +1245,109 @@ class Handler(BaseHTTPRequestHandler):
             pass                        # the browser seeked away mid-response
         except ConnectionResetError:
             pass
+        except uploads_mod.UploadError as exc:
+            self._fail(exc.code, str(exc))
+        except PermissionError as exc:
+            self._fail(403, str(exc))
         except KeyError as exc:
             self._fail(404, "no such session: %s" % exc)
         except Exception as exc:
-            if self.server.verbose:
-                import traceback
-                traceback.print_exc()
+            self._trace()
             self._fail(500, "%s: %s" % (type(exc).__name__, exc))
+
+    def do_POST(self):
+        """Uploads, and the handful of other things that change files.
+
+        Every POST must carry `X-LapVIEW: 1`. A page on another site can make a
+        browser send a plain POST here, but not one with a custom header -- that
+        needs a CORS preflight this server never answers -- so nothing outside
+        this app can push files into the inbox or delete them.
+        """
+        route = unquote(urlparse(self.path).path)
+        try:
+            if self.headers.get("X-LapVIEW") != "1":
+                return self._refuse(403, "POST needs the X-LapVIEW: 1 header")
+            self._post(route)
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
+        except uploads_mod.UploadError as exc:
+            self._refuse(exc.code, str(exc))
+        except PermissionError as exc:
+            self._refuse(403, str(exc))
+        except OSError as exc:
+            # A socket timeout mid-chunk lands here too: the page retries it.
+            self._trace()
+            self._refuse(500, "%s: %s" % (type(exc).__name__, exc))
+        except Exception as exc:
+            self._trace()
+            self._refuse(500, "%s: %s" % (type(exc).__name__, exc))
+
+    def _length(self):
+        if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
+            raise uploads_mod.UploadError("send a Content-Length, not a chunked "
+                                          "body", 411)
+        raw = self.headers.get("Content-Length")
+        if raw is None:
+            raise uploads_mod.UploadError("Content-Length is required", 411)
+        try:
+            n = int(raw)
+        except ValueError:
+            raise uploads_mod.UploadError("bad Content-Length %r" % raw) from None
+        if n < 0:
+            raise uploads_mod.UploadError("bad Content-Length %r" % raw)
+        return n
+
+    def _body_json(self, limit=65536):
+        n = self._length()
+        if n > limit:
+            raise uploads_mod.UploadError("that request body is too big", 413)
+        raw = self.rfile.read(n) if n else b"{}"
+        try:
+            body = json.loads(raw.decode("utf-8") or "{}")
+        except (UnicodeDecodeError, ValueError):
+            raise uploads_mod.UploadError("the body is not JSON") from None
+        if not isinstance(body, dict):
+            raise uploads_mod.UploadError("the body has to be a JSON object")
+        return body
+
+    def _drain(self, n):
+        """Read and discard a body we are refusing, so the answer arrives."""
+        left = n if n <= uploads_mod.MAX_CHUNK else 0
+        while left > 0:
+            got = self.rfile.read(min(1 << 20, left))
+            if not got:
+                break
+            left -= len(got)
+
+    def _post(self, route):
+        inbox = self.library.inbox
+        if route == "/api/upload/chunk":
+            q = self._q()
+            uid = q.get("id", [""])[0]
+            try:
+                offset = int(q.get("offset", ["-1"])[0])
+            except ValueError:
+                offset = -1
+            n = self._length()
+            try:
+                inbox.check_chunk(uid, offset, n)
+            except uploads_mod.UploadError:
+                self._drain(n)
+                raise
+            return self._json(inbox.write(uid, offset, n, self.rfile))
+        body = self._body_json()
+        if route == "/api/upload/folder":
+            return self._json(inbox.new_folder(body.get("name", "")))
+        if route == "/api/upload/begin":
+            return self._json(inbox.begin(body.get("folder"), body.get("name"),
+                                          body.get("size")))
+        if route == "/api/upload/finish":
+            return self._json(inbox.finish(body.get("id")))
+        if route == "/api/upload/abort":
+            return self._json(inbox.abort(body.get("id")))
+        if route == "/api/inbox/delete":
+            return self._json(inbox.delete_folder(body.get("folder")))
+        return self._refuse(404, "no POST route for %s" % route)
 
     def _route(self, route):
         lib = self.library
@@ -1016,15 +1357,38 @@ class Handler(BaseHTTPRequestHandler):
             return self._static(route[len("/static/"):])
 
         if route == "/api/config":
-            return self._json({
-                "library_dir": str(lib.cfg.library_dir),
-                "maps_dir": str(lib.cfg.maps_dir),
-                "output_dir": str(lib.cfg.output_dir),
-                "summary": lib.library().summary(),
-            })
+            return self._json(lib.client_config())
+        if route == "/api/health":
+            ok, report = lib.health()
+            return self._json(report, 200 if ok else 503)
+
+        # -- uploads and downloads ---------------------------------------
+        if route == "/api/inbox":
+            try:
+                free = shutil.disk_usage(lib.inbox_dir()).free
+            except OSError:
+                free = None
+            return self._json({"root": str(lib.inbox_dir()), "free_bytes": free,
+                               "folders": lib.inbox.folders()})
+        if route == "/api/upload/status":
+            return self._json(lib.inbox.status(self._q().get("id", [""])[0]))
+        if route == "/api/exports":
+            return self._json(lib.exports())
+        if route.startswith("/download/"):
+            try:
+                target = lib.export_file(route[len("/download/"):])
+            except KeyError:
+                return self._fail(404, "no such export")
+            return self._serve_file(target, download=True)
 
         # -- importing ---------------------------------------------------
         if route == "/api/pick":
+            if lib.headless:
+                return self._json({
+                    "error": "this server has no desktop to open a folder "
+                             "chooser on",
+                    "detail": "upload the files, or pick a folder under %s"
+                              % lib.inbox_dir(), "headless": True})
             return self._json(pick_folder())
         if route == "/api/survey":
             src = self._q().get("path", [None])[0]
@@ -1061,6 +1425,8 @@ class Handler(BaseHTTPRequestHandler):
                          "&track=<name for a new one>")
             try:
                 return self._json(lib.import_start(src, opts))
+            except PermissionError as exc:
+                return self._fail(403, str(exc))
             except Exception as exc:
                 return self._fail(500, "%s: %s" % (type(exc).__name__, exc))
         if route == "/api/import/progress":
@@ -1178,13 +1544,17 @@ class Handler(BaseHTTPRequestHandler):
             ctype += "; charset=utf-8"
         self._send(200, target.read_bytes(), ctype)
 
-    def _serve_file(self, path):
+    def _serve_file(self, path, download=False):
         """Serve a file with byte-range support.
 
         A `<video>` element will not seek without it: Chrome asks for
         `bytes=0-`, reads the moov atom, then jumps straight to the byte offset
         it wants. Answering 200 with the whole file makes every seek re-download
-        a 2 GB clip from the start.
+        a 2 GB clip from the start. The same ranges let a phone resume a
+        download that the network dropped.
+
+        `download` adds `Content-Disposition: attachment`, so the browser saves
+        the file under its own name instead of playing it in the tab.
         """
         size = path.stat().st_size
         ctype = mimetypes.guess_type(path.name)[0] or "video/mp4"
@@ -1219,6 +1589,16 @@ class Handler(BaseHTTPRequestHandler):
         if partial:
             self.send_header("Content-Range",
                              "bytes %d-%d/%d" % (start, end, size))
+        if download:
+            # Headers are latin-1: an ASCII name for old clients, the real one
+            # (RFC 6266 / 5987) for everything else.
+            plain = "".join(c if 32 <= ord(c) < 127 and c not in '"\\' else "_"
+                            for c in path.name)
+            self.send_header("Content-Disposition",
+                             "attachment; filename=\"%s\"; filename*=UTF-8''%s"
+                             % (plain, quote(path.name, safe="")))
+            self.send_header("Last-Modified",
+                             self.date_time_string(int(path.stat().st_mtime)))
         self.end_headers()
         if self.command == "HEAD":
             return
@@ -1234,8 +1614,9 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def build_config(args):
+    """CONFIG, then the LAPVIEW_* environment, then the command line."""
     import main as main_mod
-    raw = dict(main_mod.CONFIG)
+    raw = config_mod.apply_env(main_mod.CONFIG)
     if args.maps:
         raw["maps_dir"] = args.maps
     if args.library:
@@ -1246,29 +1627,59 @@ def build_config(args):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--port", type=int, default=8770)
-    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--port", type=int,
+                    default=int(os.environ.get("LAPVIEW_PORT") or 8770),
+                    help="default 8770, or LAPVIEW_PORT")
+    ap.add_argument("--host", default=os.environ.get("LAPVIEW_HOST")
+                    or "127.0.0.1",
+                    help="default 127.0.0.1, or LAPVIEW_HOST; 0.0.0.0 to "
+                         "serve other machines")
     ap.add_argument("--maps", help="override CONFIG['maps_dir']")
     ap.add_argument("--library", help="override CONFIG['library_dir'] -- the "
                                       "import screen writes here")
     ap.add_argument("--no-open", action="store_true",
                     help="do not launch a browser")
+    ap.add_argument("--headless", action="store_true",
+                    help="server mode: no folder chooser or file browser, and "
+                         "browsing confined to the data folders (also "
+                         "LAPVIEW_HEADLESS=1, and the default on Linux with no "
+                         "display or when LAPVIEW_DATA_DIR is set)")
     ap.add_argument("--quiet", action="store_true", help="no request log")
     args = ap.parse_args(argv)
 
     cfg = build_config(args)
-    Handler.library = Library(cfg)
-    got = Handler.library.library().summary()
+    headless = args.headless or headless_default()
+    roots = [p for p in (os.environ.get("LAPVIEW_BROWSE_ROOTS") or "")
+             .split(os.pathsep) if p.strip()]
+    lib = Library(cfg, headless=headless, browse_roots=roots)
+    Handler.library = lib
+    for d in (lib.lib_dir(), lib.out_dir(), lib.cache_dir()):
+        d.mkdir(parents=True, exist_ok=True)
+    lib.inbox.ensure()
+    swept = lib.inbox.sweep()
+    got = lib.library().summary()
+
+    from racechrono import encoders
+    lib.encoder = encoders.resolve(cfg, log=print)
+
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     srv.verbose = not args.quiet
+    srv.headless = headless
     url = "http://%s:%d/" % (args.host, args.port)
     print("library  %s  (%d track(s), %d lap(s), %s)"
-          % (cfg.library_dir, got["tracks"], got["laps"],
+          % (lib.lib_dir(), got["tracks"], got["laps"],
              library_mod.human(got["bytes"])))
+    print("exports  %s" % lib.out_dir())
+    print("uploads  %s%s" % (lib.inbox_dir(),
+                             "  (%d stale partial upload(s) removed)" % swept
+                             if swept else ""))
+    if headless:
+        print("mode     server: browsing limited to %s"
+              % ", ".join(str(r) for r in lib.roots()))
     if not got["laps"]:
-        print("         empty -- open the import tab and point it at a folder")
+        print("         empty -- open the library tab and import a folder")
     print("serving  %s   (ctrl-c to stop)" % url)
-    if not args.no_open:
+    if not args.no_open and not headless:
         threading.Timer(0.4, lambda: webbrowser.open(url)).start()
     try:
         srv.serve_forever()
