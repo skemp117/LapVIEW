@@ -17,27 +17,32 @@ Routes
     GET  /api/comparable/<id>           every lap at the same track
     GET  /api/compare?laps=&ref=        delta traces and a sector table
     GET  /api/export?laps=              what exporting those laps would write
-    GET  /api/export/run?laps=&preview= render them, overlay burned in
     GET  /api/export/progress           how the render is going
-    GET  /api/reveal?path=              show a finished file in the file browser
-    GET  /api/rename?kind=&id=&name=    rename a track, day, session or lap
-    GET  /api/notes?kind=&id=&text=     tags/notes on one of those
-    GET  /api/event?day=&name=          put a day under an event
-    GET  /api/delete?what=&ids=         delete laps, their video, or tracks
-    GET  /api/pick                      open the OS folder chooser
     GET  /api/survey?path=              how many files a folder holds
     GET  /api/import/review             what the last import produced
     GET  /api/browse?path=              folders under a path, for the picker
     GET  /api/import?source=&...        what importing that folder would do
-    GET  /api/import/run?...            start it on a worker thread
     GET  /api/import/progress           how the running import is going
-    GET  /api/library/reset?confirm=yes empty the library
     GET  /api/config                    paths, server mode, upload limits
     GET  /api/health                    ffmpeg, encoder, writable data dirs
     GET  /api/exports                   files in the export folder
     GET  /download/<name>               one of them, as an attachment, ranged
     GET  /api/inbox                     upload folders and what they hold
     GET  /api/upload/status?id=         how much of an upload has arrived
+    POST /api/rename                    {kind, id, name}: rename a track, day,
+                                        session or lap
+    POST /api/notes                     {kind, id, text}: tags/notes on one
+    POST /api/event                     {day, name}: put a day under an event
+    POST /api/delete                    {what, ids}: delete laps, their video,
+                                        or tracks
+    POST /api/import/run                {source, event, track|track_id, ...}:
+                                        start an import on a worker thread
+    POST /api/export/run                {laps, preview, overwrite}: render them,
+                                        overlay burned in
+    POST /api/reveal                    {path}: show an export in the file browser
+    POST /api/pick                      {}: open the OS folder chooser
+    POST /api/library/reset             {confirm: "yes"}: empty the library
+    POST /api/rescan                    {}: drop loaded laps and overlays
     POST /api/upload/folder             {name}: a new inbox folder
     POST /api/upload/begin              {folder, name, size}: start or resume
     POST /api/upload/chunk?id=&offset=  raw bytes, written at that offset
@@ -45,8 +50,10 @@ Routes
     POST /api/upload/abort              {id}: forget a partial upload
     POST /api/inbox/delete              {folder}: remove an upload folder
 
-Every POST needs an `X-LapVIEW: 1` header (see `do_POST`). Uploads are in
-`webui/uploads.py`.
+Anything that changes something is a POST, takes a JSON body, and needs an
+`X-LapVIEW: 1` header (see `do_POST`); a GET or HEAD of one answers 405 and does
+nothing. The JSON names are the query parameters these routes used to take,
+with the same meanings. Uploads are in `webui/uploads.py`.
 
 Why stdlib only: this has to run for someone who unzipped a folder and typed one
 command. A build step, a package manager or a framework is a support burden
@@ -1175,6 +1182,50 @@ def _options_from(q):
     return o
 
 
+# The routes that change something. They are POSTs, so a request for one has to
+# carry the X-LapVIEW header (see `Handler.do_POST`); a GET or HEAD of one is
+# answered 405 and does nothing. They were GETs once, and a GET is what any page
+# on any site can make a browser send -- a link, an `<img src>`, a redirect -- so
+# any page open in the same browser could have deleted the library's laps.
+ACTIONS = ("/api/rename", "/api/notes", "/api/event", "/api/delete",
+           "/api/import/run", "/api/export/run", "/api/reveal", "/api/pick",
+           "/api/library/reset", "/api/rescan")
+UPLOAD_ROUTES = ("/api/upload/folder", "/api/upload/begin",
+                 "/api/upload/chunk", "/api/upload/finish",
+                 "/api/upload/abort", "/api/inbox/delete")
+POST_ONLY = frozenset(ACTIONS + UPLOAD_ROUTES)
+
+
+def _text(v):
+    """A JSON value as the string its query parameter would have been."""
+    if v is None:
+        return ""
+    if isinstance(v, bool):
+        return "1" if v else "0"
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
+    if isinstance(v, (list, dict)):
+        raise ValueError("expected one value, got a %s" % type(v).__name__)
+    return str(v)
+
+
+def _id_list(v):
+    """Ids as a JSON list, a comma-separated string, or a list of those."""
+    if v is None:
+        return []
+    parts = v if isinstance(v, list) else [v]
+    return [i for part in parts for i in _text(part).split(",") if i]
+
+
+def _truthy(v):
+    return _text(v).strip().lower() in ("1", "yes", "true")
+
+
+def _as_query(body):
+    """A JSON body in the shape `parse_qs` gives, for `_options_from`."""
+    return {k: [_text(v)] for k, v in body.items() if v is not None}
+
+
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -1256,12 +1307,18 @@ class Handler(BaseHTTPRequestHandler):
             self._fail(500, "%s: %s" % (type(exc).__name__, exc))
 
     def do_POST(self):
-        """Uploads, and the handful of other things that change files.
+        """Everything that changes something: `ACTIONS` and the uploads.
 
         Every POST must carry `X-LapVIEW: 1`. A page on another site can make a
         browser send a plain POST here, but not one with a custom header -- that
         needs a CORS preflight this server never answers -- so nothing outside
-        this app can push files into the inbox or delete them.
+        this app can rename, delete, import, export, open a dialog, or push
+        files into the inbox.
+
+        Never answer that preflight. There is no `do_OPTIONS`, so an OPTIONS
+        request gets the stdlib's 501, and no response anywhere carries an
+        `Access-Control-Allow-*` header; either would hand the header check to
+        any site that asked.
         """
         route = unquote(urlparse(self.path).path)
         try:
@@ -1347,10 +1404,95 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(inbox.abort(body.get("id")))
         if route == "/api/inbox/delete":
             return self._json(inbox.delete_folder(body.get("folder")))
+        if route in ACTIONS:
+            return self._act(route, body)
         return self._refuse(404, "no POST route for %s" % route)
+
+    def _act(self, route, p):
+        """The routes in `ACTIONS`, from a JSON body.
+
+        The names are the query parameters these took as GETs, with the same
+        meanings: `{"kind": "lap", "id": "...", "name": "..."}` is what
+        `?kind=lap&id=...&name=...` was. A bad kind or an empty id is the
+        caller's mistake, not a server fault, and the page shows whatever comes
+        back: 400 with a sentence beats 500 with a stack trace.
+        """
+        lib = self.library
+
+        def s(key):
+            return _text(p.get(key))
+
+        missing = "lap" if route in ("/api/export/run", "/api/reveal") else "row"
+        try:
+            if route == "/api/rename":
+                return self._json(lib.rename(s("kind"), s("id"), s("name")))
+            if route == "/api/notes":
+                return self._json(lib.set_notes(s("kind"), s("id"), s("text")))
+            if route == "/api/event":
+                return self._json(lib.tag_event(s("day"), s("name")))
+            if route == "/api/delete":
+                return self._json(lib.delete(s("what"), _id_list(p.get("ids"))))
+            if route == "/api/export/run":
+                preview = s("preview")
+                return self._json(lib.export_start(
+                    _id_list(p.get("laps")),
+                    preview_s=float(preview) if preview else None,
+                    overwrite=_truthy(p.get("overwrite"))))
+            if route == "/api/reveal":
+                return self._json(lib.reveal(s("path")))
+            if route == "/api/import/run":
+                src = s("source")
+                if not src:
+                    return self._fail(400, "import needs a source folder")
+                opts = _options_from(_as_query(p))
+                # Naming is required, and the route enforces it rather than
+                # trusting the screen: this is what writes to the library. A
+                # library is worth keeping because its names mean something,
+                # and the name a phone puts in a CSV does not -- "Grip 8-22"
+                # for a season's sixth event.
+                if not opts.event:
+                    return self._fail(400, "import needs an event name (event)")
+                if not opts.track_id and not opts.track_name:
+                    return self._fail(
+                        400, "import needs a track: track_id (an existing one) "
+                             "or track (a name for a new one)")
+                return self._json(lib.import_start(src, opts))
+            if route == "/api/library/reset":
+                if s("confirm") != "yes":
+                    return self._fail(400, 'resetting the library needs '
+                                           '{"confirm": "yes"}; it cannot be '
+                                           'undone')
+                return self._json(lib.reset_library())
+            if route == "/api/pick":
+                if lib.headless:
+                    return self._json({
+                        "error": "this server has no desktop to open a folder "
+                                 "chooser on",
+                        "detail": "upload the files, or pick a folder under %s"
+                                  % lib.inbox_dir(), "headless": True})
+                return self._json(pick_folder())
+            if route == "/api/rescan":
+                lib.rescan()
+                return self._json(lib.tree())
+        except PermissionError as exc:
+            return self._fail(403, str(exc))
+        except ValueError as exc:
+            return self._fail(400, str(exc))
+        except KeyError as exc:
+            return self._fail(404, "no such %s: %s" % (missing, exc))
+        return self._refuse(404, "no POST route for %s" % route)
+
+    def _post_only(self, route):
+        """A GET or HEAD of a route that changes something: refused, not done."""
+        self._send(405, json.dumps({
+            "error": "%s changes something, so it takes a POST with an "
+                     "X-LapVIEW: 1 header" % route}),
+            "application/json; charset=utf-8", {"Allow": "POST"})
 
     def _route(self, route):
         lib = self.library
+        if route in POST_ONLY:
+            return self._post_only(route)
         if route == "/" or route == "/index.html":
             return self._static("index.html")
         if route.startswith("/static/"):
@@ -1382,14 +1524,6 @@ class Handler(BaseHTTPRequestHandler):
             return self._serve_file(target, download=True)
 
         # -- importing ---------------------------------------------------
-        if route == "/api/pick":
-            if lib.headless:
-                return self._json({
-                    "error": "this server has no desktop to open a folder "
-                             "chooser on",
-                    "detail": "upload the files, or pick a folder under %s"
-                              % lib.inbox_dir(), "headless": True})
-            return self._json(pick_folder())
         if route == "/api/survey":
             src = self._q().get("path", [None])[0]
             if not src:
@@ -1408,83 +1542,21 @@ class Handler(BaseHTTPRequestHandler):
                                                      _options_from(self._q())))
             except FileNotFoundError as exc:
                 return self._fail(400, str(exc))
-        if route == "/api/import/run":
-            src = self._q().get("source", [None])[0]
-            if not src:
-                return self._fail(400, "import needs ?source=<folder>")
-            opts = _options_from(self._q())
-            # Naming is required, and the route enforces it rather than trusting
-            # the screen: this is what writes to the library. A library is worth
-            # keeping because its names mean something, and the name a phone
-            # puts in a CSV does not -- "Grip 8-22" for a season's sixth event.
-            if not opts.event:
-                return self._fail(400, "import needs an event name (&event=)")
-            if not opts.track_id and not opts.track_name:
-                return self._fail(
-                    400, "import needs a track: &track_id=<existing> or "
-                         "&track=<name for a new one>")
-            try:
-                return self._json(lib.import_start(src, opts))
-            except PermissionError as exc:
-                return self._fail(403, str(exc))
-            except Exception as exc:
-                return self._fail(500, "%s: %s" % (type(exc).__name__, exc))
         if route == "/api/import/progress":
             return self._json(lib.import_progress())
-        if route == "/api/library/reset":
-            if self._q().get("confirm", [""])[0] != "yes":
-                return self._fail(400, "resetting the library needs "
-                                       "?confirm=yes; it cannot be undone")
-            return self._json(lib.reset_library())
 
         # -- the library -------------------------------------------------
         if route == "/api/library":
             return self._json(lib.tree())
-        if route in ("/api/rename", "/api/notes", "/api/event", "/api/delete"):
-            q = self._q()
-            ids = [i for part in q.get("ids", []) for i in part.split(",")]
-            # A bad kind or an empty id is the caller's mistake, not a server
-            # fault, and the page shows whatever comes back: 400 with a sentence
-            # beats 500 with a stack trace.
-            try:
-                if route == "/api/rename":
-                    return self._json(lib.rename(q.get("kind", [""])[0],
-                                                 q.get("id", [""])[0],
-                                                 q.get("name", [""])[0]))
-                if route == "/api/notes":
-                    return self._json(lib.set_notes(q.get("kind", [""])[0],
-                                                    q.get("id", [""])[0],
-                                                    q.get("text", [""])[0]))
-                if route == "/api/event":
-                    return self._json(lib.tag_event(q.get("day", [""])[0],
-                                                    q.get("name", [""])[0]))
-                return self._json(lib.delete(q.get("what", [""])[0], ids))
-            except ValueError as exc:
-                return self._fail(400, str(exc))
-            except KeyError as exc:
-                return self._fail(404, "no such row: %s" % exc)
-        if route in ("/api/export", "/api/export/run", "/api/export/progress",
-                     "/api/reveal"):
+        if route == "/api/export/progress":
+            return self._json(lib.export_progress())
+        if route == "/api/export":
             q = self._q()
             ids = [i for part in q.get("laps", []) for i in part.split(",")]
             try:
-                if route == "/api/export/progress":
-                    return self._json(lib.export_progress())
-                if route == "/api/export":
-                    return self._json(lib.export_offer(ids))
-                if route == "/api/reveal":
-                    return self._json(lib.reveal(q.get("path", [""])[0]))
-                preview = q.get("preview", [""])[0]
-                return self._json(lib.export_start(
-                    ids, preview_s=float(preview) if preview else None,
-                    overwrite=q.get("overwrite", [""])[0] in ("1", "yes")))
+                return self._json(lib.export_offer(ids))
             except ValueError as exc:
                 return self._fail(400, str(exc))
-            except KeyError as exc:
-                return self._fail(404, "no such lap: %s" % exc)
-        if route == "/api/rescan":
-            lib.rescan()
-            return self._json(lib.tree())
         if route == "/api/laps":
             q = self._q()
             return self._json({"laps": lib.laps(

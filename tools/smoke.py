@@ -32,6 +32,7 @@ import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -67,6 +68,26 @@ def get(base, route, want_json=True):
         body = r.read()
         return r.status, r.headers.get("Content-Type", ""), (
             json.loads(body) if want_json else body)
+
+
+def call(base, method, route, body=None, header=True):
+    """(status, headers, JSON or None) for any method, errors included."""
+    data = None if body is None else json.dumps(body).encode()
+    req = urllib.request.Request(base + route, data=data, method=method)
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+    if header and method == "POST":
+        req.add_header("X-LapVIEW", "1")
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r:
+            st, hdrs, raw = r.status, r.headers, r.read()
+    except urllib.error.HTTPError as exc:
+        st, hdrs, raw = exc.code, exc.headers, exc.read()
+    try:
+        parsed = json.loads(raw) if raw else None
+    except ValueError:
+        parsed = None
+    return st, hdrs, parsed
 
 
 def node_check(path):
@@ -220,6 +241,49 @@ def main():
            "%d csv, %d video" % (sur["csvs"], sur["videos"]))
         st, _, job = get(base, "/api/import/progress")
         ok("the import job reports", st == 200 and "state" in job, job["state"])
+
+        # The routes that change something are POSTs with the header. The
+        # arguments are ones that would change nothing even if a route were
+        # still a GET -- `--library` may be someone's real library -- and the
+        # folder chooser is left out, because a GET that still opened it would
+        # leave a dialog on this desktop.
+        harmless = {
+            "/api/rename": {"kind": "lap", "id": "nope", "name": "x"},
+            "/api/notes": {"kind": "lap", "id": "nope", "text": "x"},
+            "/api/event": {"day": "nope", "name": ""},
+            "/api/delete": {"what": "lap", "ids": ""},
+            "/api/import/run": {"source": ""},
+            "/api/export/run": {"laps": ""},
+            "/api/reveal": {"path": ""},
+            "/api/library/reset": {"confirm": "no"},
+            "/api/rescan": {},
+        }
+        got = {}
+        for route, params in harmless.items():
+            q = "?" + urllib.parse.urlencode(params) if params else ""
+            st, hdrs, _ = call(base, "GET", route + q)
+            st2, _, _ = call(base, "POST", route, params, header=False)
+            got[route] = (st, hdrs.get("Allow"), st2)
+        bad = {r: g for r, g in got.items() if g != (405, "POST", 403)}
+        ok("changes refuse a GET (405) and a POST without the header (403)",
+           not bad, "%d route(s)" % len(got) if not bad else str(bad))
+        st, _, body = call(base, "POST", "/api/rename",
+                           harmless["/api/rename"])
+        ok("a POST with the header reaches the route", st == 404,
+           "%s %s" % (st, (body or {}).get("error", "")))
+        if tmp:
+            # The throwaway library only: a rename and back, as the page does.
+            name = lap["name"]
+            st, _, body = call(base, "POST", "/api/rename",
+                               {"kind": "lap", "id": lap["id"],
+                                "name": "smoke test"})
+            _, _, now = get(base, "/api/laps")
+            renamed = next(l for l in now["laps"] if l["id"] == lap["id"])
+            ok("a lap renames by POST",
+               st == 200 and renamed["name"] == "smoke test", str(body))
+            if name:
+                call(base, "POST", "/api/rename",
+                     {"kind": "lap", "id": lap["id"], "name": name})
 
         for route in ("/api/lap/nope", "/api/nonsense", "/static/../secrets"):
             try:

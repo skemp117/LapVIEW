@@ -19,6 +19,32 @@ const API = {
                           .then(r => r.json()),
 };
 
+/* Everything that changes something -- rename, tag, delete, import, export,
+ * reveal, the folder chooser, uploads -- is a POST with this header, and a GET
+ * of one of those routes is refused. Any page on any site can make a browser
+ * send a GET here (a link, an image) or a plain form POST; none can add a
+ * custom header without a CORS preflight, which the server never answers. So
+ * the header is how the server knows the request came from this page.
+ *
+ * Resolves to the reply, with `error` set if the server refused, the same shape
+ * the GET routes give; `status` is the HTTP status. Rejects only when there was
+ * no answer at all. */
+async function postJSON(path, body, binary) {
+  const r = await fetch(path, {
+    method: 'POST',
+    headers: { 'X-LapVIEW': '1',
+               'Content-Type': binary ? 'application/octet-stream'
+                                      : 'application/json' },
+    body: binary ? body : JSON.stringify(body || {}),
+  });
+  let d = {};
+  try { d = await r.json(); } catch (e) { d = {}; }
+  if (!d || typeof d !== 'object' || Array.isArray(d)) d = {};
+  if (!r.ok && !d.error) d.error = 'HTTP ' + r.status;
+  Object.defineProperty(d, 'status', { value: r.status, enumerable: false });
+  return d;
+}
+
 /* Where the page is running, from /api/config. `headless` is a server: no
  * folder chooser, no "show in folder", downloads instead. */
 const CFG = { headless: false, inbox_dir: '', upload: null };
@@ -1738,11 +1764,10 @@ async function exportLaps(ids, opts) {
                  ? '\n\nEach file gets a download link under exports in the '
                    + 'library tab when it is done.'
                  : '\n\nInto ' + offer.out_dir))) return;
-  const q = new URLSearchParams({ laps: usable.map((l) => l.id).join(',') });
-  if (preview) q.set('preview', String(preview));
-  if ((opts || {}).overwrite) q.set('overwrite', '1');
   try {
-    const d = await fetch('/api/export/run?' + q).then((r) => r.json());
+    const d = await postJSON('/api/export/run', {
+      laps: usable.map((l) => l.id), preview: preview || null,
+      overwrite: !!(opts || {}).overwrite });
     if (d.error) return status(d.error);
   } catch (e) { return status('' + e); }
   pollExport();
@@ -1863,8 +1888,7 @@ async function refreshExports(current) {
 
 async function reveal(path) {
   try {
-    const d = await fetch('/api/reveal?path=' + encodeURIComponent(path))
-      .then((r) => r.json());
+    const d = await postJSON('/api/reveal', { path });
     if (d.error) status(d.error);
   } catch (e) { status('' + e); }
 }
@@ -1904,8 +1928,7 @@ function mgSelected(kind, id) {
 }
 
 async function mgCall(route, params) {
-  const d = await fetch(route + '?' + new URLSearchParams(params))
-    .then((r) => r.json());
+  const d = await postJSON(route, params);
   if (d.error) throw new Error(d.error);
   return d;
 }
@@ -2227,13 +2250,13 @@ $('mgDelete').onclick = () => {
   const calls = [];
   if (tracks.length) {
     calls.push(['/api/delete',
-                { what: 'track', ids: tracks.map((x) => x.id).join(',') }]);
+                { what: 'track', ids: tracks.map((x) => x.id) }]);
   }
   /* Laps under a track being deleted go with it; anything else by id. */
   const gone = new Set(tracks.flatMap((t) => mgLapsIn(t).map((l) => l.id)));
   const ids = [...new Set(laps.map((l) => l.id))].filter((i) => !gone.has(i));
   if (ids.length) {
-    calls.push(['/api/delete', { what: 'lap', ids: ids.join(',') }]);
+    calls.push(['/api/delete', { what: 'lap', ids }]);
   }
   MG.sel = [];
   mgDo('deleted ' + what, calls);
@@ -2246,7 +2269,7 @@ $('mgDelVideo').onclick = () => {
   if (!confirm('Delete the video of ' + ids.length + ' lap(s), keeping their ' +
                'telemetry?')) return;
   mgDo('deleted video from ' + ids.length + ' lap(s)',
-       [['/api/delete', { what: 'video', ids: ids.join(',') }]]);
+       [['/api/delete', { what: 'video', ids }]]);
 };
 
 $('mgClear').onclick = () => { MG.sel = []; mgPaint(); };
@@ -2408,7 +2431,7 @@ async function chooseFolder() {
   $('srcBrowse').disabled = true;
   let d;
   try {
-    d = await fetch('/api/pick').then((r) => r.json());
+    d = await postJSON('/api/pick');
   } catch (e) {
     note.className = 'bad';
     note.textContent = '' + e;
@@ -2489,7 +2512,7 @@ async function runImport() {
   q.set('source', S.src);
   let d;
   try {
-    d = await fetch('/api/import/run?' + q).then((r) => r.json());
+    d = await postJSON('/api/import/run', Object.fromEntries(q));
   } catch (err) {
     d = { error: '' + err };
   }
@@ -2791,19 +2814,13 @@ const UP = {
   free: null,
 };
 
+/* `postJSON`, thrown rather than returned when refused: `upRetry` decides from
+ * the status whether sending it again could help. */
 async function upPost(path, body, binary) {
-  const r = await fetch(path, {
-    method: 'POST',
-    headers: { 'X-LapVIEW': '1',
-               'Content-Type': binary ? 'application/octet-stream'
-                                      : 'application/json' },
-    body: binary ? body : JSON.stringify(body || {}),
-  });
-  let d = {};
-  try { d = await r.json(); } catch (e) { d = {}; }
-  if (!r.ok || d.error) {
-    const err = new Error(d.error || ('HTTP ' + r.status));
-    err.status = r.status;
+  const d = await postJSON(path, body, binary);
+  if (d.error) {
+    const err = new Error(d.error);
+    err.status = d.status;
     throw err;
   }
   return d;

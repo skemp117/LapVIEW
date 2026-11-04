@@ -3675,6 +3675,68 @@ def t_chunked_upload_assembles():
             "partials never visible; duplicates kept apart")
 
 
+class _served:
+    """The web app on a real socket, and a `call` that talks to it.
+
+        with _served(app) as call:
+            r, body = call("GET", "/api/library")
+
+    `call` adds the X-LapVIEW header to a POST unless `headers` says otherwise,
+    sends a dict as JSON, and parses the reply as JSON unless `raw`.
+    """
+
+    def __init__(self, app, headless=True):
+        self.app = app
+        self.headless = headless
+
+    def __enter__(self):
+        import http.client
+        from http.server import ThreadingHTTPServer
+        from webui import server as srv_mod
+
+        class H(srv_mod.Handler):
+            library = self.app
+        self.srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        self.srv.verbose = False
+        self.srv.headless = self.headless
+        # Each request thread opens its own sqlite connection, released when
+        # the thread ends. `server_close` waits for non-daemon threads, so the
+        # library file is free again before the directory is removed.
+        self.srv.daemon_threads = False
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+        self.conn = http.client.HTTPConnection(
+            "127.0.0.1", self.srv.server_address[1], timeout=60)
+        return self.call
+
+    def call(self, method, path, body=None, headers=None, raw=False):
+        h = {"X-LapVIEW": "1"} if method == "POST" else {}
+        h.update(headers or {})
+        h = {k: v for k, v in h.items() if v is not None}
+        if isinstance(body, dict):
+            body = json.dumps(body).encode()
+            h["Content-Type"] = "application/json"
+        self.conn.request(method, path, body=body, headers=h)
+        r = self.conn.getresponse()
+        payload = r.read()
+        if r.getheader("Connection", "").lower() == "close":
+            self.conn.close()
+        return r, (payload if raw else json.loads(payload or b"{}"))
+
+    def __exit__(self, *exc):
+        self.conn.close()
+        self.srv.shutdown()
+        self.srv.server_close()
+        # An import or export runs on a thread of its own, with its own sqlite
+        # connection; Windows will not remove the directory until it has gone.
+        for t in threading.enumerate():
+            if t.name.endswith("(work)"):
+                t.join(timeout=60)
+        self.app.close()
+        import gc
+        gc.collect()
+        return False
+
+
 def t_server_uploads_and_downloads():
     """The routes, over a real socket, in server mode.
 
@@ -3682,11 +3744,7 @@ def t_server_uploads_and_downloads():
     the browser cannot look outside the data folders; download an export with
     and without a range; and try the usual ways out of the export folder.
     """
-    import http.client
-    import json as json_mod
-    from http.server import ThreadingHTTPServer
     from urllib.parse import quote
-    from webui import server as srv_mod
     src = SOURCE / "circuit_5laps.csv"
     data = src.read_bytes()
     with tempfile.TemporaryDirectory() as tmp:
@@ -3698,33 +3756,7 @@ def t_server_uploads_and_downloads():
         export = out / "AMP lap 3 \u00fc.mp4"
         export.write_bytes(bytes(range(256)) * 8)
 
-        class H(srv_mod.Handler):
-            library = app
-        srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
-        srv.verbose = False
-        srv.headless = True
-        # Each request thread opens its own sqlite connection, released when
-        # the thread ends. `server_close` waits for non-daemon threads, so the
-        # library file is free again before the directory is removed.
-        srv.daemon_threads = False
-        threading.Thread(target=srv.serve_forever, daemon=True).start()
-        conn = http.client.HTTPConnection("127.0.0.1", srv.server_address[1],
-                                          timeout=30)
-
-        def call(method, path, body=None, headers=None, raw=False):
-            h = {"X-LapVIEW": "1"} if method == "POST" else {}
-            h.update(headers or {})
-            if isinstance(body, dict):
-                body = json_mod.dumps(body).encode()
-                h["Content-Type"] = "application/json"
-            conn.request(method, path, body=body, headers=h)
-            r = conn.getresponse()
-            payload = r.read()
-            if r.getheader("Connection", "").lower() == "close":
-                conn.close()
-            return r, (payload if raw else json_mod.loads(payload or b"{}"))
-
-        try:
+        with _served(app) as call:
             r, _ = call("POST", "/api/upload/folder", {"name": "x"},
                         headers={"X-LapVIEW": "0"})
             assert r.status == 403, "a POST without the header was accepted"
@@ -3760,9 +3792,9 @@ def t_server_uploads_and_downloads():
                 assert r.status == 403, "survey reached %s" % where
             r, br = call("GET", "/api/browse")
             assert Path(br["path"]) == app.inbox_dir() and br["parent"] == ""
-            r, _ = call("GET", "/api/reveal?path=" + quote(str(export)))
+            r, _ = call("POST", "/api/reveal", {"path": str(export)})
             assert r.status == 400, "reveal ran on a server"
-            r, pick = call("GET", "/api/pick")
+            r, pick = call("POST", "/api/pick", {})
             assert pick.get("headless") and pick.get("error"), pick
 
             r, ex = call("GET", "/api/exports")
@@ -3791,15 +3823,206 @@ def t_server_uploads_and_downloads():
             assert r.status == 400 and export.exists(), gone
             r, gone = call("POST", "/api/inbox/delete", {"folder": f["folder"]})
             assert r.status == 200 and not Path(fin["path"]).exists(), gone
-        finally:
-            conn.close()
-            srv.shutdown()
-            srv.server_close()
-            app.close()
-            import gc
-            gc.collect()
     return ("%d chunks out of order, retried; browse/survey refused 4 ways; "
             "download ranged; 7 traversal attempts 404" % len(offsets))
+
+
+def _library_state(app):
+    """Everything a misdirected request could have changed, as one value."""
+    lib = app.library()
+    with app._lock:
+        jobs = (app._job, app._xjob, sorted(app._runs))
+    return {"tree": app.tree()["tracks"],
+            "events": [e["name"] for e in lib.events()],
+            "summary": lib.summary(), "jobs": jobs}
+
+
+def t_side_effects_need_a_post():
+    """Nothing that changes the library is a GET, and a POST needs the header.
+
+    These were GETs, and a GET is what any page on any site can make a browser
+    send: an `<img src="http://<server>:8770/api/library/reset?confirm=yes">` on
+    any page open in that browser would have emptied the library. Every route in
+    `ACTIONS` is tried as a GET, a HEAD, a POST without the header and a form
+    post, with arguments that would do damage, and the library has to come out
+    unchanged.
+    """
+    from urllib.parse import urlencode
+    from webui import server as srv_mod
+    # Closed before the directory goes, even when a check fails, so the failure
+    # is what gets reported rather than a WinError from the cleanup.
+    with tempfile.TemporaryDirectory() as tmp, \
+            _closing(_server_library(tmp, headless=True)) as app:
+        app.inbox.ensure()
+        tid, laps = _stocked(app.library(), "S", laps=3)
+        day = app.library().days(tid)[0]["id"]
+        (app.inbox_dir() / "amp").mkdir()
+        shutil.copy(SOURCE / "circuit_5laps.csv", app.inbox_dir() / "amp")
+        with app._lock:
+            app._runs["sentinel"] = object()      # what a rescan would drop
+        harm = {
+            "/api/rename": {"kind": "lap", "id": laps[0], "name": "pwned"},
+            "/api/notes": {"kind": "track", "id": tid, "text": "pwned"},
+            "/api/event": {"day": day, "name": "pwned"},
+            "/api/delete": {"what": "track", "ids": tid},
+            "/api/import/run": {"source": "amp", "event": "pwned",
+                                "track": "pwned", "video": "0"},
+            "/api/export/run": {"laps": ",".join(laps)},
+            "/api/reveal": {"path": str(Path(tmp) / "out")},
+            "/api/pick": {},
+            "/api/library/reset": {"confirm": "yes"},
+            "/api/rescan": {},
+        }
+        before = _library_state(app)
+        with _served(app) as call:
+            for route, args in harm.items():
+                url = route + ("?" + urlencode(args) if args else "")
+                for method in ("GET", "HEAD"):
+                    r, _ = call(method, url, raw=True)
+                    assert r.status == 405, "%s %s answered %d" % (
+                        method, route, r.status)
+                    assert r.getheader("Allow") == "POST", (
+                        route, r.getheader("Allow"))
+                for hdr in (None, "0", "yes"):
+                    r, _ = call("POST", route, args,
+                                headers={"X-LapVIEW": hdr})
+                    assert r.status == 403, \
+                        "POST %s with X-LapVIEW=%r answered %d" % (
+                            route, hdr, r.status)
+                # A form post is the other thing another site can send.
+                r, _ = call("POST", route, urlencode(args).encode(),
+                            headers={"X-LapVIEW": None, "Content-Type":
+                                     "application/x-www-form-urlencoded"})
+                assert r.status == 403, (route, r.status)
+            for route in ("/api/upload/folder", "/api/upload/begin",
+                          "/api/upload/chunk", "/api/upload/finish",
+                          "/api/upload/abort", "/api/inbox/delete"):
+                r, _ = call("GET", route, raw=True)
+                assert r.status == 405, (route, r.status)
+
+            # No preflight is ever granted, and no response invites one.
+            for method, route in (("OPTIONS", "/api/delete"),
+                                  ("OPTIONS", "/api/upload/folder"),
+                                  ("GET", "/api/library"), ("GET", "/"),
+                                  ("POST", "/api/delete")):
+                r, _ = call(method, route, {} if method == "POST" else None,
+                            headers={"Origin": "http://evil.example",
+                                     "Access-Control-Request-Method": "POST",
+                                     "Access-Control-Request-Headers":
+                                         "x-lapview", "X-LapVIEW": None},
+                            raw=True)
+                cors = [k for k, _v in r.getheaders()
+                        if k.lower().startswith("access-control-")]
+                assert not cors, "%s %s sent %s" % (method, route, cors)
+                if method == "OPTIONS":
+                    assert r.status >= 400, "OPTIONS answered %d" % r.status
+            after = _library_state(app)
+        assert after == before, "a refused request changed the library"
+        assert sorted(harm) == sorted(srv_mod.ACTIONS), \
+            "a route in ACTIONS has no check here"
+        src = Path(srv_mod.__file__).read_text(encoding="utf-8")
+        assert "def do_OPTIONS" not in src, "something answers a preflight"
+        assert '"Access-Control-' not in src, "the server sends a CORS header"
+
+        # And the page itself: no moved route is fetched with a GET.
+        js = (ROOT / "webui/static/app.js").read_text(encoding="utf-8")
+        for route in srv_mod.ACTIONS:
+            assert "fetch('%s" % route not in js, \
+                "app.js still GETs %s" % route
+    return ("%d routes x GET, HEAD, 3 bad headers and a form post: all "
+            "refused, library unchanged; no CORS header anywhere"
+            % len(harm))
+
+
+def t_posts_with_the_header_work():
+    """The same routes, as the page sends them, against a scratch library."""
+    with tempfile.TemporaryDirectory() as tmp, \
+            _closing(_server_library(tmp, headless=True)) as app:
+        app.inbox.ensure()
+        lib = app.library()
+        tid, laps = _stocked(lib, "S", laps=4)
+        day = lib.days(tid)[0]["id"]
+        with _served(app) as call:
+            r, got = call("POST", "/api/rename",
+                          {"kind": "lap", "id": laps[0], "name": " Quick one "})
+            assert r.status == 200, got
+            assert lib.lap(laps[0])["name"] == "Quick one", lib.lap(laps[0])
+            r, got = call("POST", "/api/rename",
+                          {"kind": "track", "id": tid, "name": "AMP Full"})
+            assert r.status == 200 and lib.track(tid)["name"] == "AMP Full"
+            r, got = call("POST", "/api/rename",
+                          {"kind": "lap", "id": "nope", "name": "x"})
+            assert r.status == 404, (r.status, got)
+            r, got = call("POST", "/api/rename",
+                          {"kind": "bogus", "id": laps[0], "name": "x"})
+            assert r.status == 400, (r.status, got)
+            r, got = call("POST", "/api/rename",
+                          {"kind": "lap", "id": laps[0], "name": "  "})
+            assert r.status == 400, (r.status, got)
+
+            r, got = call("POST", "/api/notes",
+                          {"kind": "track", "id": tid, "text": "dry, 24C"})
+            assert r.status == 200 and lib.track(tid)["notes"] == "dry, 24C"
+            r, got = call("POST", "/api/event", {"day": day, "name": "Grip 6"})
+            assert r.status == 200 and got["created"], got
+            assert app.tree()["tracks"][0]["days"][0]["event"] == "Grip 6"
+
+            # ids as a list, as the page sends them, and as the old string.
+            r, got = call("POST", "/api/delete",
+                          {"what": "lap", "ids": [laps[1]]})
+            assert r.status == 200 and got["count"] == 1, got
+            assert lib.lap(laps[1]) is None
+            r, got = call("POST", "/api/delete",
+                          {"what": "lap", "ids": "%s," % laps[2]})
+            assert r.status == 200 and lib.lap(laps[2]) is None, got
+            r, got = call("POST", "/api/delete", {"what": "lap", "ids": []})
+            assert r.status == 400, got
+            r, got = call("POST", "/api/delete", {"what": "everything",
+                                                  "ids": [tid]})
+            assert r.status == 400 and lib.track(tid) is not None, got
+
+            r, got = call("POST", "/api/export/run", {"laps": [laps[0]],
+                                                      "preview": 2})
+            assert r.status == 400 and "footage" in got["error"], got
+            r, got = call("POST", "/api/rescan", {})
+            assert r.status == 200 and got["tracks"], got
+
+            r, got = call("POST", "/api/library/reset", {})
+            assert r.status == 400 and lib.summary()["laps"] == 2, got
+            r, got = call("POST", "/api/library/reset", {"confirm": "yes"})
+            assert r.status == 200 and got["library"]["laps"] == 0, got
+
+            # An import, end to end, with the options as the page sends them:
+            # strings from a form, and a source relative to the inbox.
+            (app.inbox_dir() / "amp").mkdir()
+            shutil.copy(SOURCE / "circuit_5laps.csv", app.inbox_dir() / "amp")
+            opts = {"source": "amp", "pad": "3", "cq": "28", "audio": "1",
+                    "video": "0", "track": "Test Circuit"}
+            r, got = call("POST", "/api/import/run", opts)
+            assert r.status == 400 and "event" in got["error"], got
+            r, got = call("POST", "/api/import/run",
+                          dict(opts, event="Night 1", track=""))
+            assert r.status == 400 and "track" in got["error"], got
+            r, got = call("POST", "/api/import/run",
+                          dict(opts, event="Night 1", source="../.."))
+            assert r.status == 403, (r.status, got)
+            r, got = call("POST", "/api/import/run",
+                          dict(opts, event="Night 1"))
+            assert r.status == 200 and got["state"] == "running", got
+            deadline = time.time() + 180
+            while True:
+                r, job = call("GET", "/api/import/progress")
+                if job["state"] != "running" or time.time() > deadline:
+                    break
+                time.sleep(0.2)
+            assert job["state"] == "done", job
+            tree = app.tree()["tracks"]
+            assert [t["name"] for t in tree] == ["Test Circuit"], tree
+            assert tree[0]["days"][0]["event"] == "Night 1", tree[0]["days"]
+            n = job["result"]["laps"]
+            assert n > 0 and lib.summary()["laps"] == n, job["result"]
+    return ("rename, notes, event, delete, rescan, reset and an import of %d "
+            "lap(s), all by POST" % n)
 
 
 def t_headless_is_decided():
@@ -3951,6 +4174,9 @@ def main():
     check("chunked upload assembles", t_chunked_upload_assembles)
     check("uploads, browsing and downloads over HTTP",
           t_server_uploads_and_downloads)
+    check("changes need a POST with the header",
+          t_side_effects_need_a_post)
+    check("POSTs with the header do the work", t_posts_with_the_header_work)
 
     print()
     if _TIMING:

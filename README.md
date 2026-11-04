@@ -152,6 +152,20 @@ inbox, the library and any `LAPVIEW_BROWSE_ROOTS` -- the browser cannot read
 anything else on the box. There is no login: keep the port on a private
 network (Tailscale, a LAN), not the internet.
 
+**Other sites cannot drive it.** No login also means any page open in the same
+browser can send requests to the app's address. Everything that changes
+something (renaming, tagging, deleting, resetting, importing, exporting, the
+folder chooser, uploads) is a `POST` with a JSON body and an `X-LapVIEW: 1`
+header. Another site can make a browser send a `GET` (a link, an image) or a
+plain form `POST`, but it can't add that header without a CORS preflight, and
+the server never answers one. A `GET` of one of those routes answers
+`405 Method Not Allowed` and does nothing. From a terminal:
+
+```bash
+curl -X POST -H 'X-LapVIEW: 1' -H 'Content-Type: application/json' \
+     -d '{"confirm": "yes"}' http://<server>:8770/api/library/reset
+```
+
 **Health.** `GET /api/health` reports the encoder that was chosen and why, the
 ffmpeg it found, whether each data folder is writable, and free space. It
 answers 503 if ffmpeg is missing or a folder is not writable; the image's
@@ -931,25 +945,36 @@ socket, which is where eight of the checks below live.
 
 | route | what it returns |
 |---|---|
-| `/api/library` | tracks, their days, and the laps under each |
-| `/api/lap/<id>` | one lap: channels, map geometry, the driven line, its video |
-| `/api/trace/<id>?ch=&n=` | one channel of a lap, decimated to `n` points |
-| `/api/comparable/<id>` | every lap at the same track, across every day |
-| `/api/compare?laps=&ref=` | delta traces, sector table, GPS gaps |
-| `/api/rename?kind=&id=&name=` | rename a track, day, session or lap |
-| `/api/notes?kind=&id=&text=` | its tags or notes |
-| `/api/event?day=&name=` | put a day under an event, creating it if new |
-| `/api/delete?what=&ids=` | delete laps, their video, or whole tracks |
-| `/api/pick` | opens the OS folder chooser and returns what was chosen |
-| `/api/survey?path=` | how many data and video files a folder holds, and their size |
-| `/api/browse?path=` | folders under a path, for a picker that cannot use the dialog |
-| `/api/import?source=&...` | what importing that folder would do, without doing it |
-| `/api/import/run?...` | do it, in the background |
-| `/api/import/progress` | phase, laps done, bytes written, ETA |
-| `/api/import/review` | what the last import produced: tracks, maps, laps |
-| `/api/layout/<id>` | overlay frame size and region geometry |
-| `/api/overlay/<id>?t=` | the overlay at that moment, packed BGRA |
-| `/video/<id>` | that lap's video, byte-range served |
+| `GET /api/library` | tracks, their days, and the laps under each |
+| `GET /api/lap/<id>` | one lap: channels, map geometry, the driven line, its video |
+| `GET /api/trace/<id>?ch=&n=` | one channel of a lap, decimated to `n` points |
+| `GET /api/comparable/<id>` | every lap at the same track, across every day |
+| `GET /api/compare?laps=&ref=` | delta traces, sector table, GPS gaps |
+| `GET /api/survey?path=` | how many data and video files a folder holds, and their size |
+| `GET /api/browse?path=` | folders under a path, for a picker that cannot use the dialog |
+| `GET /api/import?source=&...` | what importing that folder would do, without doing it |
+| `GET /api/import/progress` | phase, laps done, bytes written, ETA |
+| `GET /api/import/review` | what the last import produced: tracks, maps, laps |
+| `GET /api/export?laps=` | what exporting those laps would write |
+| `GET /api/export/progress` | how the render is going, and the finished files |
+| `GET /api/layout/<id>` | overlay frame size and region geometry |
+| `GET /api/overlay/<id>?t=` | the overlay at that moment, packed BGRA |
+| `GET /video/<id>` | that lap's video, byte-range served |
+| `POST /api/rename` `{kind, id, name}` | rename a track, day, session or lap |
+| `POST /api/notes` `{kind, id, text}` | its tags or notes |
+| `POST /api/event` `{day, name}` | put a day under an event, creating it if new |
+| `POST /api/delete` `{what, ids}` | delete laps (`lap`), their video (`video`), or whole tracks (`track`) |
+| `POST /api/pick` `{}` | opens the OS folder chooser and returns what was chosen |
+| `POST /api/import/run` `{source, event, track` or `track_id, ...}` | do the import, in the background |
+| `POST /api/export/run` `{laps, preview, overwrite}` | render those laps with the overlay burned in |
+| `POST /api/reveal` `{path}` | show an export in the desktop's file browser |
+| `POST /api/library/reset` `{confirm: "yes"}` | empty the library |
+| `POST /api/rescan` `{}` | forget loaded laps and overlays, and return the tree |
+
+The `POST` routes take a JSON body whose names are the query parameters they
+used to take, need an `X-LapVIEW: 1` header, and answer `405` to a `GET`; see
+"Other sites cannot drive it" above. `ids` and `laps` are a list or a
+comma-separated string. `webui/server.py` has the full table, uploads included.
 
 The screen is in the URL — `/#library` for the library tab, `/#compare` for the
 laps tab with a comparison already up — so a reload keeps it and a link can point
