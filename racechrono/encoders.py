@@ -8,18 +8,21 @@ mid-stream, which is what makes a one-second test encode an honest check:
   laptop on its iGPU. NVENC cannot be opened at all, so the encode falls back to
   the CPU: libx265 for HEVC, libx264 for H.264 (`encode.cpu_fallback`).
 * **An older NVENC.** Pascal (GTX 10-series, Quadro P, Tesla P) encodes HEVC but
-  has no HEVC B-frames, and no generation before Turing can use B-frames as
-  references. Asking for either makes the driver refuse the session. The
-  `pascal` profile leaves both out. `auto` reads the card's name from
-  nvidia-smi; `LAPVIEW_NVENC_PROFILE=pascal` says so outright.
-* **Temporal AQ.** Not offered for HEVC before Turing, and treated here as
-  something to try rather than assume: when the configured arguments fail, the
-  same encoder is tried again without it before anything else is given up.
+  not with B-frames, B-frame references or temporal AQ: measured on the GTX
+  1070 Max-Q in `lap` (driver 580), hevc_nvenc fails at init with -22 on any
+  one of `-bf 3`, `-b_ref_mode middle` and `-temporal-aq 1`. H.264 takes
+  B-frames. The `pascal` profile (see `render.encoder_args`) leaves out what
+  fails. `auto` reads the card's name from nvidia-smi;
+  `LAPVIEW_NVENC_PROFILE=pascal` says so outright.
+* **Temporal AQ elsewhere.** Treated as something to try rather than assume:
+  when the configured arguments fail, the same encoder is tried again without
+  it before anything else is given up.
 
 `resolve(cfg)` runs that ladder and writes the winner into `cfg.encode`, so
-ingest and export afterwards use whatever was proven to work. `cpu_equivalent`
-is the same fallback for a render that fails later, e.g. when every NVENC
-session on a consumer card is already taken.
+ingest and export afterwards use whatever was proven to work.
+`runtime_fallbacks` is the same ladder for a render that fails later -- the
+pascal-safe arguments once, then the CPU -- e.g. when the card is not the one
+the probe saw, or every NVENC session on a consumer card is already taken.
 """
 from __future__ import annotations
 
@@ -46,7 +49,9 @@ _PRE_TURING = re.compile(
 # ffmpeg's stderr to decide whether a failed render is worth retrying on the CPU.
 NVENC_FAILURES = ("nvenc", "cuda", "openencodesessionex", "no capable devices",
                   "out of memory", "sessions", "device creation failed",
-                  "hwaccel", "libnvidia-encode", "b-frames", "temporal aq")
+                  "hwaccel", "libnvidia-encode", "b-frames", "temporal aq",
+                  "initializeencoder", "error while opening encoder",
+                  "invalid argument", "-22")
 
 _resolved = {}
 
@@ -112,6 +117,33 @@ def cpu_equivalent(enc):
     return fb
 
 
+def pascal_safe(enc):
+    """A copy of `enc` with the pascal profile and temporal AQ off."""
+    c = copy.deepcopy(enc)
+    c.nvenc_profile = "pascal"
+    c.temporal_aq = False
+    return c
+
+
+def runtime_fallbacks(enc):
+    """What to retry a failed NVENC encode with, in order.
+
+    The pascal-safe arguments once (if they differ from what just failed),
+    then the CPU. Empty for a CPU encoder: there is nothing to fall back to.
+    """
+    if not enc.is_nvenc:
+        return []
+    from .render import encoder_args
+    out = []
+    safe = pascal_safe(enc)
+    if encoder_args(safe) != encoder_args(enc):
+        out.append(safe)
+    fb = cpu_equivalent(enc)
+    if fb is not None:
+        out.append(fb)
+    return out
+
+
 def looks_like_nvenc_failure(text):
     low = (text or "").lower()
     return any(k in low for k in NVENC_FAILURES)
@@ -137,7 +169,13 @@ def _run(cmd, timeout=60):
 
 
 def _candidates(enc):
-    """What to try, best first. Each is (label, EncodeCfg)."""
+    """What to try, best first. Each is (label, EncodeCfg).
+
+    A step whose arguments come out the same as an earlier one is left out --
+    on a pascal-profile HEVC encode temporal AQ is already off, so "without
+    temporal AQ" would only repeat the test that just failed.
+    """
+    from .render import encoder_args
     out = [("as configured", copy.deepcopy(enc))]
     if enc.is_nvenc:
         if enc.temporal_aq:
@@ -145,10 +183,7 @@ def _candidates(enc):
             c.temporal_aq = False
             out.append(("without temporal AQ", c))
         if enc.nvenc_profile != "pascal":
-            c = copy.deepcopy(enc)
-            c.nvenc_profile = "pascal"
-            c.temporal_aq = False
-            out.append(("with the pascal profile", c))
+            out.append(("with the pascal profile", pascal_safe(enc)))
         fb = cpu_equivalent(enc)
         if fb is not None:
             out.append(("on the CPU", fb))
@@ -156,7 +191,13 @@ def _candidates(enc):
                 last = copy.deepcopy(fb)
                 last.encoder = "libx264"
                 out.append(("on the CPU, as H.264", last))
-    return out
+    seen, kept = set(), []
+    for label, cand in out:
+        key = (cand.encoder, tuple(encoder_args(cand)))
+        if key not in seen:
+            seen.add(key)
+            kept.append((label, cand))
+    return kept
 
 
 def resolve(cfg, log=None, runner=None, gpu_list=None, ffmpeg=None):
@@ -235,7 +276,11 @@ def resolve(cfg, log=None, runner=None, gpu_list=None, ffmpeg=None):
     report["profile"] = enc.nvenc_profile if enc.is_nvenc else None
     report["fallback"] = label != "as configured"
     report["chosen"] = label
-    report["temporal_aq"] = bool(enc.temporal_aq) if enc.is_nvenc else None
+    from .render import encoder_args
+    report["args"] = encoder_args(enc)
+    report["temporal_aq"] = ("-temporal-aq" in report["args"] and report["args"][
+        report["args"].index("-temporal-aq") + 1] == "1") if enc.is_nvenc \
+        else None
     report["hwaccel_decode"] = bool(enc.hwaccel_decode) if enc.is_nvenc \
         else False
     say("encoder  %s" % describe(enc, report))
@@ -246,10 +291,12 @@ def describe(enc, report=None):
     """One line for a log: what encodes, with which concessions."""
     if enc.is_nvenc:
         hevc = "hevc" in enc.encoder
+        legacy = enc.nvenc_profile == "pascal"
         bits = ["%s profile" % enc.nvenc_profile]
-        if enc.nvenc_profile == "pascal":
-            bits.append("no HEVC B-frames" if hevc else "no B-frame references")
-        bits.append("temporal AQ %s" % ("on" if enc.temporal_aq else "off"))
+        if legacy:
+            bits.append("no B-frames" if hevc else "no B-frame references")
+        taq = enc.temporal_aq and not (legacy and hevc)
+        bits.append("temporal AQ %s" % ("on" if taq else "off"))
         bits.append("CUDA decode" if enc.hwaccel_decode else "CPU decode")
         text = "%s (%s)" % (enc.encoder, ", ".join(bits))
     else:

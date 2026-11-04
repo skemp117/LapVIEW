@@ -729,22 +729,30 @@ def _encode(ffmpeg, segments, dst, options, encoder="hevc_nvenc", verbose=False,
             nvenc_profile=None, fallback=None):
     """Trim and re-encode one lap, joining camera splits if it straddles one.
 
-    `fallback` is the CPU encoder to retry with when an NVENC encode fails the
-    way a missing or busy GPU does. The server proves its encoder at startup,
-    so this is for the GPU going away later, not for choosing one.
+    When an NVENC encode fails the way a missing, busy or older GPU does, it
+    is retried with the pascal-safe arguments (no HEVC B-frames), then with
+    `fallback`, the CPU encoder. The server proves its encoder at startup, so
+    this is for a card that behaves differently later, not for choosing one.
     """
-    try:
-        return _encode_with(ffmpeg, segments, dst, options, encoder, verbose,
-                            nvenc_profile)
-    except subprocess.CalledProcessError as exc:
-        from . import encoders
-        err = exc.stderr.decode("utf-8", "replace") if isinstance(
-            exc.stderr, bytes) else str(exc.stderr or "")
-        if not (fallback and encoder.endswith("nvenc")
-                and encoders.looks_like_nvenc_failure(err or encoder)):
-            raise
-        return _encode_with(ffmpeg, segments, dst, options, fallback, verbose,
-                            None)
+    from . import encoders
+    tries = [(encoder, nvenc_profile)]
+    if encoder.endswith("nvenc"):
+        if "hevc" in encoder and nvenc_profile != "pascal":
+            tries.append((encoder, "pascal"))
+        if fallback:
+            tries.append((fallback, None))
+    for i, (enc, profile) in enumerate(tries):
+        try:
+            return _encode_with(ffmpeg, segments, dst, options, enc, verbose,
+                                profile)
+        except subprocess.CalledProcessError as exc:
+            err = exc.stderr.decode("utf-8", "replace") if isinstance(
+                exc.stderr, bytes) else str(exc.stderr or "")
+            # With the output not captured (verbose) there is no message to
+            # read, so an NVENC encoder failing is taken as NVENC failing.
+            last = i == len(tries) - 1
+            if last or not encoders.looks_like_nvenc_failure(err or enc):
+                raise
 
 
 def _encode_with(ffmpeg, segments, dst, options, encoder, verbose,

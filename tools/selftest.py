@@ -3375,8 +3375,13 @@ def t_pascal_args_are_safe():
     from racechrono import encoders, ingest as ingest_mod
     modern = _pairs(render.encoder_args(_enc(nvenc_profile="turing").encode))
     assert modern["-bf"] == "3" and modern["-b_ref_mode"] == "middle", modern
+    assert modern["-temporal-aq"] == "1" and modern["-rc-lookahead"] == "32"
+    # Measured on the GTX 1070 Max-Q: HEVC opens with none of B-frames,
+    # B-frame references or temporal AQ, at p7 / cq 26 / lookahead 20.
     hevc = _pairs(render.encoder_args(_enc(nvenc_profile="pascal").encode))
     assert hevc["-bf"] == "0" and "-b_ref_mode" not in hevc, hevc
+    assert hevc["-temporal-aq"] == "0", hevc
+    assert int(hevc["-rc-lookahead"]) <= 20, hevc
     h264 = _pairs(render.encoder_args(
         _enc(encoder="h264_nvenc", nvenc_profile="pascal").encode))
     assert h264["-bf"] == "3" and "-b_ref_mode" not in h264, h264
@@ -3417,23 +3422,51 @@ def t_encoder_falls_back():
         run.seen = seen
         return run
 
-    # A GTX 1070 with no HEVC temporal AQ: the pascal profile from the name,
-    # then the same encoder again without temporal AQ.
+    # What the GTX 1070 Max-Q in `lap` does (driver 580): hevc_nvenc fails at
+    # init on any of these, and on nothing else that was tried.
+    gtx1070 = [lambda t: "hevc_nvenc" in t and "-temporal-aq 1" in t,
+               lambda t: "hevc_nvenc" in t and "-bf 3" in t,
+               lambda t: "hevc_nvenc" in t and "-b_ref_mode" in t]
+
+    # Named by nvidia-smi: the pascal profile opens first time.
     cfg = _enc()
-    run = runner([lambda t: "-temporal-aq 1" in t])
+    run = runner(gtx1070)
     got = encoders.resolve(cfg, runner=run, ffmpeg="ffmpeg",
                            gpu_list=[{"name": "NVIDIA GeForce GTX 1070"}])
     first = _pairs(run.seen[0])
-    assert first["-bf"] == "0" and "-b_ref_mode" not in first, first
-    assert cfg.encode.encoder == "hevc_nvenc" and not cfg.encode.temporal_aq
-    assert got["profile"] == "pascal" and got["fallback"], got
+    assert len(run.seen) == 1 and first["-bf"] == "0", run.seen
+    assert first["-temporal-aq"] == "0" and "-b_ref_mode" not in first, first
+    assert got["profile"] == "pascal" and not got["fallback"], got
 
-    # An unnamed card that refuses B-frame references drops to pascal.
+    # Unnamed (no nvidia-smi in the container): the turing settings fail, and
+    # the ladder reaches the pascal profile before it gives up on the GPU.
     cfg = _enc()
-    run = runner([lambda t: "-b_ref_mode" in t])
-    got = encoders.resolve(cfg, runner=run, ffmpeg="ffmpeg", gpu_list=[])
+    got = encoders.resolve(cfg, runner=runner(gtx1070), ffmpeg="ffmpeg",
+                           gpu_list=[])
     assert (cfg.encode.encoder, cfg.encode.nvenc_profile) == ("hevc_nvenc",
                                                               "pascal"), got
+    assert got["temporal_aq"] is False, got
+
+    # A newer card that only refuses temporal AQ keeps everything else.
+    cfg = _enc()
+    got = encoders.resolve(cfg, runner=runner([lambda t: "-temporal-aq 1" in t]),
+                           ffmpeg="ffmpeg",
+                           gpu_list=[{"name": "NVIDIA GeForce RTX 4090"}])
+    assert got["chosen"] == "without temporal AQ", got
+    assert cfg.encode.nvenc_profile == "turing" and not cfg.encode.temporal_aq
+
+    # After startup: a failed NVENC render retries pascal-safe, then the CPU;
+    # already pascal-safe, straight to the CPU.
+    chain = encoders.runtime_fallbacks(_enc(nvenc_profile="turing").encode)
+    assert [(e.encoder, e.nvenc_profile) for e in chain] == [
+        ("hevc_nvenc", "pascal"), ("libx265", "turing")], chain
+    chain = encoders.runtime_fallbacks(_enc(nvenc_profile="pascal").encode)
+    assert [e.encoder for e in chain] == ["libx265"], chain
+    assert encoders.runtime_fallbacks(_enc(encoder="libx264",
+                                           preset="medium").encode) == []
+    assert encoders.looks_like_nvenc_failure(
+        "Error while opening encoder - maybe incorrect parameters such as "
+        "bit_rate, rate, width or height\nError code: -22 Invalid argument")
 
     # No GPU at all: the CPU, same codec, with an x26x preset and no CUDA.
     for asked, want in (("hevc_nvenc", "libx265"), ("h264_nvenc", "libx264")):

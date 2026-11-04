@@ -23,6 +23,10 @@ from .gauges.base import Layout
 
 # ---------------------------------------------------------------- ffmpeg
 
+# The longest lookahead measured to open on a Pascal NVENC.
+PASCAL_LOOKAHEAD = 20
+
+
 def encoder_args(enc):
     """Video encoder settings.
 
@@ -37,20 +41,28 @@ def encoder_args(enc):
     target is being hit, i.e. alongside `maxrate`.
 
     The `pascal` NVENC profile (GTX 10-series and older) drops what that
-    encoder cannot do and would refuse to open a session for: B-frames in HEVC,
-    and B-frames used as references in either codec. See `encoders.py`.
+    encoder cannot do and would refuse to open a session for. Measured on a GTX
+    1070 Max-Q (driver 580): hevc_nvenc fails at init with -22 on any of
+    `-temporal-aq 1`, `-bf 3` or `-b_ref_mode middle`, and is fine at p7, cq 26,
+    spatial AQ and a 20-frame lookahead; h264_nvenc takes `-bf 3`. So HEVC gets
+    none of the three, H.264 keeps its B-frames but not as references, and the
+    lookahead stays within the 20 frames that were measured. See `encoders.py`.
     """
     if not enc.is_nvenc:
         return ["-preset", enc.preset, "-crf", str(enc.crf)]
 
     legacy = getattr(enc, "nvenc_profile", "auto") == "pascal"
-    bframes = 0 if (legacy and "hevc" in enc.encoder) else enc.bframes
+    hevc = "hevc" in enc.encoder
+    bframes = 0 if (legacy and hevc) else enc.bframes
+    temporal = enc.temporal_aq and not (legacy and hevc)
+    lookahead = min(enc.rc_lookahead, PASCAL_LOOKAHEAD) if legacy \
+        else enc.rc_lookahead
     args = ["-preset", enc.preset, "-tune", enc.tune,
             "-rc", "vbr", "-cq", str(enc.cq), "-b:v", "0",
             "-multipass", enc.multipass,
-            "-rc-lookahead", str(enc.rc_lookahead),
+            "-rc-lookahead", str(lookahead),
             "-spatial-aq", "1" if enc.spatial_aq else "0",
-            "-temporal-aq", "1" if enc.temporal_aq else "0",
+            "-temporal-aq", "1" if temporal else "0",
             "-aq-strength", str(enc.aq_strength),
             "-bf", str(bframes)]
     if bframes > 0 and not legacy:
