@@ -168,7 +168,7 @@ All optional. Unset, nothing changes from the desktop behaviour.
 | `LAPVIEW_HOST` | `127.0.0.1` (`0.0.0.0` in the image) | address to listen on |
 | `LAPVIEW_PORT` | `8770` | port |
 | `LAPVIEW_HEADLESS` | see above | `1` server mode, `0` desktop |
-| `LAPVIEW_BROWSE_ROOTS` | none | extra folders a server may import from, `:`-separated |
+| `LAPVIEW_BROWSE_ROOTS` | none | extra folders a server may import from, `:`-separated (`;` on Windows) |
 | `LAPVIEW_ENCODER` | `hevc_nvenc` | `hevc_nvenc`, `h264_nvenc`, `libx265` or `libx264`, for import and export |
 | `LAPVIEW_ENCODER_PRESET` | `p7` for NVENC, `medium` for x264/x265 | |
 | `LAPVIEW_NVENC_PROFILE` | `auto` | `pascal` for a GTX 10-series, `turing` for RTX and newer; `auto` asks nvidia-smi |
