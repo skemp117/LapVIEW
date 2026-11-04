@@ -10,12 +10,49 @@ full-frame clear.
 from __future__ import annotations
 
 import math
+import os
+import shutil
+import subprocess
+import sys
 from abc import ABC, abstractmethod
 
 import cairo
 
-FONT = "Segoe UI"
+FONT_PREFERRED = "Segoe UI"
 FONT_FALLBACK = "DejaVu Sans"
+
+
+def _font_installed(family):
+    """Whether fontconfig knows this family. False where there is no fc-list."""
+    fc = shutil.which("fc-list")
+    if not fc:
+        return False
+    try:
+        out = subprocess.run([fc, ":family=%s" % family, "family"],
+                             capture_output=True, text=True, timeout=10).stdout
+    except Exception:
+        return False
+    return bool(out.strip())
+
+
+def pick_font(environ=None, platform=None, installed=_font_installed):
+    """The gauge face: LAPVIEW_FONT, else Segoe UI where it exists, else DejaVu.
+
+    Cairo's toy font API never fails on a missing family -- fontconfig quietly
+    substitutes whatever it likes -- so asking for Segoe UI in a Linux container
+    gives a font nobody chose, and numerals that change width between machines.
+    Choosing the fallback by name makes the substitute a decision.
+    """
+    env = os.environ if environ is None else environ
+    want = str(env.get("LAPVIEW_FONT") or "").strip()
+    if want:
+        return want
+    if (platform or sys.platform) == "win32":
+        return FONT_PREFERRED
+    return FONT_PREFERRED if installed(FONT_PREFERRED) else FONT_FALLBACK
+
+
+FONT = pick_font()
 
 
 # ------------------------------------------------------------------ layout

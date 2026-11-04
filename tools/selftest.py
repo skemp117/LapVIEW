@@ -3480,6 +3480,17 @@ def t_real_probe_settles():
                                       encoders.describe(forced.encode))
 
 
+def t_font_has_a_named_fallback():
+    """Segoe UI on Windows; a font that is actually installed everywhere else."""
+    from racechrono.gauges import base
+    pick = base.pick_font
+    assert pick({"LAPVIEW_FONT": "Inter"}) == "Inter"
+    assert pick({}, platform="win32") == "Segoe UI"
+    assert pick({}, platform="linux", installed=lambda f: False) == "DejaVu Sans"
+    assert pick({}, platform="linux", installed=lambda f: True) == "Segoe UI"
+    return "this machine draws gauges in %s" % base.FONT
+
+
 # ------------------------------------------------------------ web server
 
 def _server_library(tmp, **kw):
@@ -3642,6 +3653,7 @@ def main():
     check("pascal arguments are safe", t_pascal_args_are_safe)
     check("the encoder falls back", t_encoder_falls_back)
     check("the real probe settles", t_real_probe_settles)
+    check("the gauge font has a named fallback", t_font_has_a_named_fallback)
     area("web server")
     check("a reset answers after wiping", t_reset_answers_after_wiping)
 
