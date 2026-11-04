@@ -101,6 +101,14 @@ class Library:
         self._plan_source = None
         self._job = None
         self._xjob = None            # the export, which is its own job
+        # Caches the library reset and the import worker clear. They were only
+        # ever cleared, never made, so a reset wiped the library and then
+        # answered 500, and every import ended in an AttributeError in its
+        # `finally` -- harmless only because the thread died right after.
+        self._summaries = None
+        self._listings = {}
+        self._sessions = {}
+        self._telemetry = {}
 
     # ---------------------------------------------------------------- basics
     def library(self):
@@ -820,6 +828,7 @@ class Library:
 
     def reset_library(self):
         before = self.library().reset()
+        self.rescan()                 # loaded laps and overlays are gone too
         with self._lock:
             self._plan = None
             self._plan_source = None

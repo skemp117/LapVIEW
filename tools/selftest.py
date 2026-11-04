@@ -3309,6 +3309,40 @@ def t_library_bulk_selection():
                 "nothing, deleting the 1 leaves 3")
 
 
+# ------------------------------------------------------------ web server
+
+def _server_library(tmp, **kw):
+    """The web app's Library over a library, output and inbox in `tmp`."""
+    from webui import server as srv_mod
+    cfg = config_mod.load(copy.deepcopy(CONFIG))
+    cfg.library_dir = Path(tmp) / "lib"
+    cfg.output_dir = Path(tmp) / "out"
+    cfg.inbox_dir = Path(tmp) / "inbox"
+    cfg.cache_dir = Path(tmp) / "cache"
+    return srv_mod.Library(cfg, **kw)
+
+
+def t_reset_answers_after_wiping():
+    """Resetting the library has to answer, not 500 after the damage is done.
+
+    The caches it clears were never created, so the wipe happened and then the
+    request failed -- the page reported an error for something that had worked.
+    The import worker's `finally` tripped over the same missing attribute.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _server_library(tmp)
+        with _closing(app):
+            _stocked(app.library(), "S", laps=3)
+            assert app.library().summary()["laps"] == 3
+            got = app.reset_library()
+            assert got["library"]["laps"] == 0, got
+            assert got["cleared"]["laps"] == 3, got
+            # what the import worker's `finally` does, by hand
+            with app._lock:
+                app._listings.clear()
+        return "3 laps cleared, the reset answered, the worker's cleanup runs"
+
+
 def main():
     if "--list" in sys.argv:
         _WANTED.append("--none--")       # matches no area: names only
@@ -3432,6 +3466,8 @@ def main():
     check("plan structure", t_job_plan_structure)
     check("report is a view of the plan", t_job_plan_matches_text_report)
     check("probe finds a usable encoder", t_job_probe)
+    area("web server")
+    check("a reset answers after wiping", t_reset_answers_after_wiping)
 
     print()
     if _TIMING:
