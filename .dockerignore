@@ -1,0 +1,44 @@
+# Build context for the Dockerfile. Data never goes into the image: it lives
+# in the /data mount.
+.git
+.gitignore
+.dockerignore
+Dockerfile
+
+# Runtime data and render output (desktop locations)
+library/
+Laps/
+Output/
+cache/
+inbox/
+Raw Data/
+Raw Footage/
+
+# Notes, notebooks, reference pictures
+*.md
+*.ipynb
+.ipynb_checkpoints/
+Reference Images/
+
+# Python and editor leftovers
+**/__pycache__/
+**/*.py[cod]
+.venv/
+venv/
+.env
+.vscode/
+.idea/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Stray footage anywhere. tests/data keeps its two 1 MB clips so
+# `python tools/selftest.py` can be run inside the container.
+**/*.mp4
+**/*.mov
+**/*.m4v
+**/*.mkv
+**/*.avi
+**/*.insv
+**/*.lrv
+!tests/data/*.mp4

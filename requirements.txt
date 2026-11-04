@@ -1,0 +1,7 @@
+# What the code imports. ffmpeg and ffprobe are system binaries (apt in the
+# Dockerfile; on Windows, anywhere on PATH). Pillow is not needed: job.probe
+# only reports whether it happens to be installed.
+numpy>=1.26,<3
+pandas>=2.1,<4
+scipy>=1.11,<2
+pycairo>=1.25,<2
