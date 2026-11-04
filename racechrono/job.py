@@ -75,8 +75,11 @@ def load_config(job):
     """The job's config, or the CONFIG in main.py when it does not carry one."""
     raw = job.get("config")
     if raw is None:
+        # The same CONFIG every other entry point uses, environment included,
+        # so a job run in a container writes under LAPVIEW_DATA_DIR and not
+        # into the read-only code directory it was started from.
         import main as main_mod
-        raw = copy.deepcopy(main_mod.CONFIG)
+        raw = config_mod.apply_env(copy.deepcopy(main_mod.CONFIG))
     cfg = config_mod.load(raw)
     if job.get("select", {}).get("export") not in (None, "sessions", "laps", "both"):
         raise config_mod.ConfigError(
