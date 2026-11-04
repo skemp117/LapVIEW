@@ -94,16 +94,93 @@ estimated output duration.
 
 ## Requirements
 
-- Python 3.11+ with `numpy`, `pandas`, `pycairo`, `Pillow`, `scipy`
+- Python 3.11+ with `numpy`, `pandas`, `pycairo`, `scipy`
 - `ffmpeg` and `ffprobe` on `PATH`, or set `CONFIG["ffmpeg"]`
 
 ```bash
-pip install numpy pandas pycairo Pillow scipy
+pip install -r requirements.txt
 ```
 
 If ffmpeg is not on `PATH` the pipeline also looks in a few common Windows
 install locations before giving up. Point `CONFIG["ffmpeg"]["ffmpeg"]` at a
 binary or a directory to be explicit.
+
+## Running on a server (Docker)
+
+The web app also runs as a container on a Linux box and is used from a phone
+or another computer's browser. The `Dockerfile` builds it (Debian 13, Python
+3.12, Debian's ffmpeg, which has `h264_nvenc`/`hevc_nvenc`):
+
+```bash
+docker build -t lapview .
+docker run -d --name lapview --restart unless-stopped --gpus all \
+    -p 8770:8770 -v /mnt/bulk/lapview:/data \
+    -e LAPVIEW_NVENC_PROFILE=pascal lapview
+```
+
+`--gpus all` needs the NVIDIA driver and `nvidia-container-toolkit` on the
+host. Without it the app still runs and encodes on the CPU. The container runs
+as uid/gid 1000, so the host folder has to be writable by 1000.
+
+Everything it keeps is under `/data`:
+
+| path | what |
+|---|---|
+| `/data/library/` | the lap library: `library.db`, `laps/<id>/`, `tracks/<id>/` |
+| `/data/output/` | exported videos, downloadable from the library tab |
+| `/data/inbox/` | uploads, one folder per upload (`2026-11-03_141502_name/`); `.partial/` holds files still arriving |
+| `/data/cache/` | scratch for exports |
+| `/data/maps/` | optional; without it the maps shipped in `Maps/` are used |
+
+**Uploading.** The library tab has an upload card. Choose files (on an iPhone,
+from Photos or Files; a camera's `.insv`/`.lrv` may need "choose any file type"),
+or drag them in on a desktop. Each file goes up in 8 MB chunks that are retried
+if the connection drops, and lands in the folder only when all of it has
+arrived. Then **Import this upload** fills in the import box with that folder;
+name the event and track and press Import as usual. Keep the page open and the
+screen on while it uploads (the page asks the phone to keep the screen awake).
+Uploads that were imported can be deleted from the same card.
+
+**Exports** have a **download** link (byte ranges, so a dropped phone download
+resumes), and files from earlier sessions are listed too. "Show in folder" and
+the folder chooser only exist on a desktop.
+
+**Server mode** is on whenever `LAPVIEW_DATA_DIR` is set, on Linux with no
+display, with `--headless`, or with `LAPVIEW_HEADLESS=1` (`0` turns it off). It
+hides the desktop-only controls and confines browsing and importing to the
+inbox, the library and any `LAPVIEW_BROWSE_ROOTS` -- the browser cannot read
+anything else on the box. There is no login: keep the port on a private
+network (Tailscale, a LAN), not the internet.
+
+**Health.** `GET /api/health` reports the encoder that was chosen and why, the
+ffmpeg it found, whether each data folder is writable, and free space. It
+answers 503 if ffmpeg is missing or a folder is not writable; the image's
+`HEALTHCHECK` uses it.
+
+### Environment variables
+
+All optional. Unset, nothing changes from the desktop behaviour.
+
+| variable | default | |
+|---|---|---|
+| `LAPVIEW_DATA_DIR` | unset (`/data` in the image) | root for `library/`, `output/`, `cache/`, `inbox/`, `maps/` |
+| `LAPVIEW_LIBRARY_DIR`, `_OUTPUT_DIR`, `_CACHE_DIR`, `_INBOX_DIR`, `_MAPS_DIR` | under the data dir | one folder each, overriding the data dir |
+| `LAPVIEW_HOST` | `127.0.0.1` (`0.0.0.0` in the image) | address to listen on |
+| `LAPVIEW_PORT` | `8770` | port |
+| `LAPVIEW_HEADLESS` | see above | `1` server mode, `0` desktop |
+| `LAPVIEW_BROWSE_ROOTS` | none | extra folders a server may import from, `:`-separated |
+| `LAPVIEW_ENCODER` | `hevc_nvenc` | `hevc_nvenc`, `h264_nvenc`, `libx265` or `libx264`, for import and export |
+| `LAPVIEW_ENCODER_PRESET` | `p7` for NVENC, `medium` for x264/x265 | |
+| `LAPVIEW_NVENC_PROFILE` | `auto` | `pascal` for a GTX 10-series, `turing` for RTX and newer; `auto` asks nvidia-smi |
+| `LAPVIEW_NVENC_TEMPORAL_AQ` | `1` | `0` turns temporal AQ off (always off for HEVC on Pascal) |
+| `LAPVIEW_HWACCEL_DECODE` | `1` | `0` decodes on the CPU in exports |
+| `LAPVIEW_CPU_FALLBACK` | `auto` | encoder when NVENC will not open: `auto` (same codec), `libx264`, `libx265`, `none` |
+| `LAPVIEW_FFMPEG`, `LAPVIEW_FFPROBE` | PATH | explicit binaries |
+| `LAPVIEW_FONT` | Segoe UI on Windows, else DejaVu Sans | gauge font |
+| `LAPVIEW_UPLOAD_MAX_GB` | `64` | largest single upload |
+
+The command line still wins over the environment (`--host`, `--port`,
+`--library`, `--maps`).
 
 ## Configuration
 
@@ -509,6 +586,31 @@ would accumulate at every join.
 GeForce cards cap concurrent NVENC sessions (8 on current drivers). If an output
 fails at encoder init because the sessions are exhausted, it is retried on the
 CPU encoder and the substitution is reported rather than the output being lost.
+
+### Older GPUs, and none at all
+
+The tuning above is Turing-and-newer. A Pascal card (GTX 10-series) refuses to
+open an HEVC session that asks for B-frames, B-frames as references or temporal
+AQ -- measured on a GTX 1070 Max-Q, driver 580: each one alone fails at init
+with `-22`, while `p7`, `cq 26`, spatial AQ and a 20-frame lookahead are fine.
+`encode.nvenc_profile` (`LAPVIEW_NVENC_PROFILE`) handles that: `pascal` drops
+all three for HEVC, keeps B-frames (but not as references) for H.264, and caps
+the lookahead at 20. `auto` picks `pascal` or `turing` from the card name
+nvidia-smi reports. The import's re-encode gets `-bf 0` on Pascal for the same
+reason.
+
+The web server does not trust any of that blindly. At startup it encodes one
+second of test pattern with the exact arguments a real export would use, and
+walks down until something opens: as configured, without temporal AQ, the
+pascal profile, then the CPU (`libx265` for HEVC, `libx264` for H.264, or
+`encode.cpu_fallback`). The choice is logged and shown by `/api/health`. If an
+NVENC export or import still fails later, it is retried once with the
+pascal-safe arguments and then on the CPU.
+
+Imported clips are tagged `hvc1` as well. ffmpeg's default `hev1` is the same
+bitstream, but Safari -- every iPhone -- will not play it. Clips imported before
+this change can be re-tagged without re-encoding:
+`ffmpeg -i video.mp4 -c copy -tag:v hvc1 -movflags +faststart fixed.mp4`.
 
 ## Raw IMU: vehicle-frame acceleration
 
