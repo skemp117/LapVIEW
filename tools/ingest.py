@@ -33,7 +33,9 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("source", help="the folder to import from")
-    ap.add_argument("--library", default="library")
+    ap.add_argument("--library", default=None,
+                    help="default: CONFIG['library_dir'], or LAPVIEW_DATA_DIR/"
+                         "library when that is set")
     ap.add_argument("--maps")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--no-encode", action="store_true",
@@ -80,11 +82,14 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     import main as main_mod
-    raw = copy.deepcopy(main_mod.CONFIG)
+    raw = config_mod.apply_env(copy.deepcopy(main_mod.CONFIG))
     if args.maps:
         raw["maps_dir"] = args.maps
     cfg = config_mod.load(raw)
-    lib = library_mod.Library(ROOT / args.library)
+    lib = library_mod.Library(ROOT / (args.library or cfg.library_dir))
+    if not args.dry_run and not args.no_encode:
+        from racechrono import encoders
+        encoders.resolve(cfg, log=print)
 
     options = ingest_mod.Options(
         pad_s=args.pad, cq=args.cq,

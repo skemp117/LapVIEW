@@ -27,6 +27,7 @@ CONFIG = {
     "library_dir":   "library",   # the lap library ingest writes to
     "output_dir":    "Output",
     "cache_dir":     "cache",
+    "inbox_dir":     "inbox",     # where browser uploads land, one folder each
 
     "map_file": None,              # None = auto-select by location
     "manifest": "runs.json",       # optional CSV-stem -> clip-list mapping
@@ -58,12 +59,19 @@ CONFIG = {
     # lap -- 2.5x smaller than h264 cq21 and indistinguishable at 1:1. See the
     # README for the full curve. Switch to "h264_nvenc" for maximum
     # compatibility, or "libx265"/"libx264" (which use `crf`) for a CPU encode.
+    #
+    # `nvenc_profile` "auto" asks nvidia-smi which card this is: a GTX 10-series
+    # (Pascal) gets no HEVC B-frames and no B-frame references, which it cannot
+    # do. The web server test-encodes once at startup and falls back to the CPU
+    # (`cpu_fallback`) when NVENC cannot be opened at all. Every key here can
+    # also be set from the environment -- see `config.apply_env`.
     "encode":  {"encoder": "hevc_nvenc", "cq": 26, "preset": "p7",
                 "tune": "hq", "multipass": "disabled", "rc_lookahead": 32,
                 "spatial_aq": True, "temporal_aq": True, "aq_strength": 8,
                 "bframes": 3, "b_ref_mode": "middle", "maxrate": None,
                 "crf": 20, "hwaccel_decode": True, "copy_audio": True,
-                "audio_bitrate": "192k", "fps": None},
+                "audio_bitrate": "192k", "fps": None,
+                "nvenc_profile": "auto", "cpu_fallback": "auto"},
 
     "ffmpeg":  {"ffmpeg": None, "ffprobe": None},   # None = PATH, then fallbacks
 
@@ -330,7 +338,7 @@ def _job_from_args(raw_config, args):
 
 def main(argv=None):
     args = parse_args(argv)
-    cfg = apply_overrides(config_mod.load(CONFIG), args)
+    cfg = apply_overrides(config_mod.load(config_mod.apply_env(CONFIG)), args)
     Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
     Path(cfg.cache_dir).mkdir(parents=True, exist_ok=True)
 

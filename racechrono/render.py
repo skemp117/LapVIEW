@@ -35,10 +35,16 @@ def encoder_args(enc):
     size nor quality at constant `cq` (74.2 MB either way), while being the most
     encoder-expensive option available -- it earns its keep only when a bitrate
     target is being hit, i.e. alongside `maxrate`.
+
+    The `pascal` NVENC profile (GTX 10-series and older) drops what that
+    encoder cannot do and would refuse to open a session for: B-frames in HEVC,
+    and B-frames used as references in either codec. See `encoders.py`.
     """
     if not enc.is_nvenc:
         return ["-preset", enc.preset, "-crf", str(enc.crf)]
 
+    legacy = getattr(enc, "nvenc_profile", "auto") == "pascal"
+    bframes = 0 if (legacy and "hevc" in enc.encoder) else enc.bframes
     args = ["-preset", enc.preset, "-tune", enc.tune,
             "-rc", "vbr", "-cq", str(enc.cq), "-b:v", "0",
             "-multipass", enc.multipass,
@@ -46,8 +52,8 @@ def encoder_args(enc):
             "-spatial-aq", "1" if enc.spatial_aq else "0",
             "-temporal-aq", "1" if enc.temporal_aq else "0",
             "-aq-strength", str(enc.aq_strength),
-            "-bf", str(enc.bframes)]
-    if enc.bframes > 0:
+            "-bf", str(bframes)]
+    if bframes > 0 and not legacy:
         args += ["-b_ref_mode", enc.b_ref_mode]
     if enc.maxrate:
         args += ["-maxrate", enc.maxrate, "-bufsize", enc.maxrate]
@@ -547,6 +553,18 @@ _NVENC_EXHAUSTED = ("OpenEncodeSessionEx failed", "out of memory",
                     "No capable devices found", "sessions")
 
 
+def cpu_fallback_cfg(cfg):
+    """A copy of `cfg` that encodes on the CPU, or None when that is off."""
+    from . import encoders
+    fb_enc = encoders.cpu_equivalent(cfg.encode)
+    if fb_enc is None:
+        return None
+    import copy
+    fb = copy.deepcopy(cfg)
+    fb.encode = fb_enc
+    return fb
+
+
 def _run_task(t):
     try:
         return render_target(t["cfg"], t["run_path"], t["target"], t["segments"],
@@ -557,13 +575,9 @@ def _run_task(t):
         # One output too many fails at encoder init rather than mid-stream, so
         # fall that one back to software instead of losing it.
         cfg = t["cfg"]
-        if (cfg.encode.is_nvenc
+        fb = cpu_fallback_cfg(cfg) if cfg.encode.is_nvenc else None
+        if (fb is not None
                 and any(k.lower() in msg.lower() for k in _NVENC_EXHAUSTED)):
-            import copy
-            fb = copy.deepcopy(cfg)
-            fb.encode.encoder = "libx265" if "hevc" in cfg.encode.encoder else "libx264"
-            fb.encode.hwaccel_decode = False
-            fb.encode.preset = "medium"
             try:
                 res = render_target(fb, t["run_path"], t["target"], t["segments"],
                                     t["out"], t["tm"], keep_parts=t["keep_parts"])

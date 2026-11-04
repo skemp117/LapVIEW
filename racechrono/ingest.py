@@ -113,8 +113,13 @@ class Options:
     track_id: str = ""                    # or put every session on this one
     date_override: str = ""
 
-    def video_args(self, encoder):
-        """The ffmpeg arguments these options imply."""
+    def video_args(self, encoder, nvenc_profile=None):
+        """The ffmpeg arguments these options imply.
+
+        HEVC is tagged `hvc1`. ffmpeg's default is `hev1`, which Safari -- and
+        so every iPhone -- refuses to play, though the bitstream is identical.
+        On a Pascal card HEVC gets no B-frames, which that NVENC cannot do.
+        """
         out = []
         if self.height:
             out += ["-vf", "scale=-2:%d" % int(self.height)]
@@ -122,8 +127,12 @@ class Options:
             out += ["-r", str(int(self.fps))]
         if encoder.endswith("nvenc"):
             out += ["-c:v", encoder, "-cq", str(self.cq), "-preset", "p5"]
+            if nvenc_profile == "pascal" and "hevc" in encoder:
+                out += ["-bf", "0"]
         else:
             out += ["-c:v", encoder, "-crf", str(self.cq), "-preset", "medium"]
+        if "hevc" in encoder or "265" in encoder:
+            out += ["-tag:v", "hvc1"]
         out += ["-pix_fmt", "yuv420p"]
         out += ["-c:a", "aac", "-b:a", "128k"] if self.audio else ["-an"]
         return out
@@ -716,8 +725,30 @@ def _write_lap_csv(src, dst, t0, t1, header_extra):
     return kept
 
 
-def _encode(ffmpeg, segments, dst, options, encoder="hevc_nvenc", verbose=False):
-    """Trim and re-encode one lap, joining camera splits if it straddles one."""
+def _encode(ffmpeg, segments, dst, options, encoder="hevc_nvenc", verbose=False,
+            nvenc_profile=None, fallback=None):
+    """Trim and re-encode one lap, joining camera splits if it straddles one.
+
+    `fallback` is the CPU encoder to retry with when an NVENC encode fails the
+    way a missing or busy GPU does. The server proves its encoder at startup,
+    so this is for the GPU going away later, not for choosing one.
+    """
+    try:
+        return _encode_with(ffmpeg, segments, dst, options, encoder, verbose,
+                            nvenc_profile)
+    except subprocess.CalledProcessError as exc:
+        from . import encoders
+        err = exc.stderr.decode("utf-8", "replace") if isinstance(
+            exc.stderr, bytes) else str(exc.stderr or "")
+        if not (fallback and encoder.endswith("nvenc")
+                and encoders.looks_like_nvenc_failure(err or encoder)):
+            raise
+        return _encode_with(ffmpeg, segments, dst, options, fallback, verbose,
+                            None)
+
+
+def _encode_with(ffmpeg, segments, dst, options, encoder, verbose,
+                 nvenc_profile):
     dst.parent.mkdir(parents=True, exist_ok=True)
     parts = []
     for i, seg in enumerate(segments):
@@ -732,7 +763,7 @@ def _encode(ffmpeg, segments, dst, options, encoder="hevc_nvenc", verbose=False)
         cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
                "-ss", "%.3f" % coarse, "-i", str(seg.clip.path),
                "-ss", "%.3f" % fine, "-t", "%.3f" % seg.duration]
-        cmd += options.video_args(encoder)
+        cmd += options.video_args(encoder, nvenc_profile)
         cmd += ["-movflags", "+faststart", str(part)]
         subprocess.run(cmd, check=True, capture_output=not verbose)
         parts.append(part)
@@ -740,9 +771,15 @@ def _encode(ffmpeg, segments, dst, options, encoder="hevc_nvenc", verbose=False)
         listing = dst.with_suffix(".txt")
         listing.write_text("".join("file '%s'\n" % p.name for p in parts),
                            encoding="utf-8")
+        # The join keeps the tag and the front-loaded index the parts were
+        # written with: without them a lap that straddles a camera split was
+        # the one clip a phone would not play, or not until it had all of it.
+        tag = (["-tag:v", "hvc1"] if "hevc" in encoder or "265" in encoder
+               else [])
         subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
                         "-f", "concat", "-safe", "0", "-i", str(listing),
-                        "-c", "copy", str(dst)],
+                        "-c", "copy"] + tag + ["-movflags", "+faststart",
+                                               str(dst)],
                        check=True, capture_output=not verbose, cwd=str(dst.parent))
         for p in parts:
             p.unlink(missing_ok=True)
@@ -839,9 +876,12 @@ def apply(plan_obj, library, cfg, encode=True, verbose=True, on_progress=None,
                             "Source session": sp.path.name})
             vbytes = 0
             if encode and lp.has_video and plan_obj.options.import_video:
+                from . import encoders
                 vbytes = _encode(ffmpeg, lp.segments, d / "video.mp4",
                                  plan_obj.options, cfg.encode.encoder,
-                                 verbose=False)
+                                 verbose=False,
+                                 nvenc_profile=cfg.encode.nvenc_profile,
+                                 fallback=encoders.cpu_encoder(cfg.encode))
             library.db.execute(
                 "UPDATE laps SET video_path=?, data_path=?, video_bytes=?, "
                 "data_bytes=? WHERE id=?",

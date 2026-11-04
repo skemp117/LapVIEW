@@ -6,8 +6,13 @@ layout key that silently does nothing is worse than a crash.
 """
 from __future__ import annotations
 
+import copy
+import os
 from dataclasses import dataclass, field, fields
 from pathlib import Path
+
+ENCODERS = ("libx264", "libx265", "h264_nvenc", "hevc_nvenc")
+NVENC_PROFILES = ("auto", "pascal", "turing")
 
 KNOWN_ELEMENTS = ("track_map", "speedo", "tacho", "gmeter", "throttle",
                   # Registered but unimplemented; enabling one raises.
@@ -146,6 +151,14 @@ class EncodeCfg:
     overlay_regions: object = "auto"        # "auto" | True | False
     max_overlay_regions: int = 2
     extra_args: list = field(default_factory=list)
+    # Which NVENC generation the arguments are written for. "turing" is Turing
+    # and newer (HEVC B-frames, B-frames as references); "pascal" leaves both
+    # out, because a GTX 10-series refuses to open an encoder that asks for
+    # them. "auto" asks nvidia-smi at startup (racechrono/encoders.py).
+    nvenc_profile: str = "auto"
+    # What to encode with when NVENC cannot be opened at all: "auto" keeps the
+    # codec (libx265 for HEVC, libx264 for H.264), "none" fails instead.
+    cpu_fallback: str = "auto"
 
     @property
     def is_nvenc(self):
@@ -158,8 +171,15 @@ class EncodeCfg:
         return bool(self.overlay_regions)
 
     def validate(self):
-        if self.encoder not in ("libx264", "libx265", "h264_nvenc", "hevc_nvenc"):
-            raise ConfigError("encode.encoder: %r not supported" % self.encoder)
+        if self.encoder not in ENCODERS:
+            raise ConfigError("encode.encoder: %r not one of %s"
+                              % (self.encoder, ", ".join(ENCODERS)))
+        if self.nvenc_profile not in NVENC_PROFILES:
+            raise ConfigError("encode.nvenc_profile: %r not one of %s"
+                              % (self.nvenc_profile, ", ".join(NVENC_PROFILES)))
+        if self.cpu_fallback not in ("auto", "none", "libx264", "libx265"):
+            raise ConfigError("encode.cpu_fallback: %r not one of auto, none, "
+                              "libx264, libx265" % self.cpu_fallback)
         _rng("encode.crf", self.crf, 0, 51)
         _rng("encode.cq", self.cq, 0, 51)
         _rng("encode.rc_lookahead", self.rc_lookahead, 0, 250)
@@ -285,6 +305,7 @@ class Config:
     library_dir: Path = Path("library")
     output_dir: Path = Path("Output")
     cache_dir: Path = Path("cache")
+    inbox_dir: Path = Path("inbox")
     map_file: Path | None = None
     manifest: Path = Path("runs.json")
     workers: int | None = None
@@ -303,9 +324,9 @@ class Config:
         return [e for e in self.elements.values() if e.enabled]
 
 
-_TOP_KEYS = {"maps_dir", "output_dir", "cache_dir", "library_dir", "map_file",
-             "manifest", "workers", "sync", "quality", "trim", "imu", "encode",
-             "ffmpeg", "elements"}
+_TOP_KEYS = {"maps_dir", "output_dir", "cache_dir", "library_dir", "inbox_dir",
+             "map_file", "manifest", "workers", "sync", "quality", "trim", "imu",
+             "encode", "ffmpeg", "elements"}
 
 _ELEMENT_COMMON = {"enabled", "anchor", "x", "y"}
 
@@ -349,7 +370,7 @@ def load(raw):
 
     cfg = Config()
     for key in ("maps_dir", "output_dir", "cache_dir", "library_dir",
-                "manifest"):
+                "inbox_dir", "manifest"):
         if key in raw and raw[key] is not None:
             setattr(cfg, key, Path(raw[key]))
     if raw.get("map_file"):
@@ -462,3 +483,101 @@ def _validate_element_opts(el):
         _rng("elements.%s.backing_alpha" % el.name, el.opts["backing_alpha"], 0.0, 1.0)
     if "sweep_deg" in el.opts:
         _rng("elements.%s.sweep_deg" % el.name, el.opts["sweep_deg"], 30.0, 350.0)
+
+
+# ------------------------------------------------------------ environment
+#
+# A container is configured with environment variables, not by editing main.py.
+# Everything here is optional, and with none of them set CONFIG comes back
+# exactly as it went in -- the desktop install is configured the way it always
+# was. Paths given this way are made absolute, so nothing depends on the
+# directory the server happened to be started from (`cache_dir` used to).
+
+_TRUE = ("1", "true", "yes", "on")
+_FALSE = ("0", "false", "no", "off")
+
+# config key, its own variable, its folder under LAPVIEW_DATA_DIR
+ENV_DIRS = (("library_dir", "LAPVIEW_LIBRARY_DIR", "library"),
+            ("output_dir", "LAPVIEW_OUTPUT_DIR", "output"),
+            ("cache_dir", "LAPVIEW_CACHE_DIR", "cache"),
+            ("inbox_dir", "LAPVIEW_INBOX_DIR", "inbox"),
+            ("maps_dir", "LAPVIEW_MAPS_DIR", "maps"))
+
+
+def env_flag(value, name="value"):
+    """A yes/no environment value. Anything else is a mistake worth naming."""
+    v = str(value).strip().lower()
+    if v in _TRUE:
+        return True
+    if v in _FALSE:
+        return False
+    raise ConfigError("%s: %r is not a yes/no value (use 1 or 0)" % (name, value))
+
+
+def apply_env(raw, environ=None, root=None):
+    """CONFIG with any LAPVIEW_* environment variables laid over it.
+
+    LAPVIEW_DATA_DIR puts library/, output/, cache/ and inbox/ under one folder
+    (and maps/, when that folder exists -- otherwise the maps shipped with the
+    code are used). Each also has its own override, e.g. LAPVIEW_LIBRARY_DIR,
+    which wins over the data dir. LAPVIEW_ENCODER, LAPVIEW_ENCODER_PRESET,
+    LAPVIEW_NVENC_PROFILE, LAPVIEW_NVENC_TEMPORAL_AQ, LAPVIEW_HWACCEL_DECODE and
+    LAPVIEW_CPU_FALLBACK set the matching `encode` keys; LAPVIEW_FFMPEG and
+    LAPVIEW_FFPROBE the binaries. The result still goes through `load`, so a bad
+    value is reported the same way a bad CONFIG entry is.
+    """
+    env = os.environ if environ is None else environ
+    root = Path(root) if root else Path(__file__).resolve().parent
+    out = copy.deepcopy(raw)
+
+    def get(name):
+        return str(env.get(name) or "").strip()
+
+    data = get("LAPVIEW_DATA_DIR")
+    if data:
+        base = Path(data).expanduser().resolve()
+        for key, _var, sub in ENV_DIRS:
+            if key != "maps_dir":
+                out[key] = str(base / sub)
+        maps = base / "maps"
+        out["maps_dir"] = str(maps if maps.is_dir()
+                              else (root / (raw.get("maps_dir") or "Maps")).resolve())
+    for key, var, _sub in ENV_DIRS:
+        if get(var):
+            out[key] = str(Path(get(var)).expanduser().resolve())
+
+    enc = dict(out.get("encode") or {})
+    name = get("LAPVIEW_ENCODER").lower()
+    if name:
+        if name not in ENCODERS:
+            raise ConfigError("LAPVIEW_ENCODER: %r not one of %s"
+                              % (name, ", ".join(ENCODERS)))
+        enc["encoder"] = name
+        # NVENC and x264/x265 name their presets differently, and `load`
+        # rejects a mismatch. Switching encoder switches the preset family.
+        preset = str(enc.get("preset") or "")
+        if name.endswith("nvenc"):
+            if not preset.startswith("p"):
+                enc["preset"] = "p7"
+        elif not preset or preset.startswith("p"):
+            enc["preset"] = "medium"
+    if get("LAPVIEW_ENCODER_PRESET"):
+        enc["preset"] = get("LAPVIEW_ENCODER_PRESET")
+    if get("LAPVIEW_NVENC_PROFILE"):
+        enc["nvenc_profile"] = get("LAPVIEW_NVENC_PROFILE").lower()
+    for key, var in (("temporal_aq", "LAPVIEW_NVENC_TEMPORAL_AQ"),
+                     ("hwaccel_decode", "LAPVIEW_HWACCEL_DECODE")):
+        if get(var):
+            enc[key] = env_flag(get(var), var)
+    if get("LAPVIEW_CPU_FALLBACK"):
+        enc["cpu_fallback"] = get("LAPVIEW_CPU_FALLBACK").lower()
+    if enc != (out.get("encode") or {}):
+        out["encode"] = enc
+
+    ff = dict(out.get("ffmpeg") or {})
+    for key, var in (("ffmpeg", "LAPVIEW_FFMPEG"), ("ffprobe", "LAPVIEW_FFPROBE")):
+        if get(var):
+            ff[key] = get(var)
+    if ff != (out.get("ffmpeg") or {}):
+        out["ffmpeg"] = ff
+    return out

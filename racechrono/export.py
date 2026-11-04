@@ -122,12 +122,30 @@ def export_lap(cfg, library, lap_id, out_dir=None, overwrite=False,
                 "bytes": out_path.stat().st_size}
 
     tm_path = _map_path(cfg, library, got["track_id"])
-    res = render.render_segment(cfg, run_path, seg, out_path, tm_path,
-                                quiet=True, label=name, on_frame=on_frame)
-    return {**got, "out": str(out_path), "bytes": out_path.stat().st_size,
-            "seconds": res.get("seconds", duration),
-            "speed": res.get("speed", 0.0), "elapsed": res.get("elapsed", 0.0),
-            "no_map": tm_path is None}
+    note = ""
+    try:
+        res = render.render_segment(cfg, run_path, seg, out_path, tm_path,
+                                    quiet=True, label=name, on_frame=on_frame)
+    except RuntimeError as exc:
+        # The server proves its encoder at startup, but a consumer card can
+        # still run out of NVENC sessions, or the GPU can go away under a
+        # container. One retry on the CPU beats losing the export.
+        from . import encoders
+        fb = render.cpu_fallback_cfg(cfg) if cfg.encode.is_nvenc else None
+        if fb is None or not encoders.looks_like_nvenc_failure(str(exc)):
+            raise
+        note = "NVENC failed (%s); encoded with %s" % (
+            str(exc).strip().splitlines()[-1][:200], fb.encode.encoder)
+        res = render.render_segment(fb, run_path, seg, out_path, tm_path,
+                                    quiet=True, label=name, on_frame=on_frame)
+    got_out = {**got, "out": str(out_path), "bytes": out_path.stat().st_size,
+               "seconds": res.get("seconds", duration),
+               "speed": res.get("speed", 0.0),
+               "elapsed": res.get("elapsed", 0.0),
+               "no_map": tm_path is None}
+    if note:
+        got_out["note"] = note
+    return got_out
 
 
 def export(cfg, library, lap_ids, out_dir=None, overwrite=False,

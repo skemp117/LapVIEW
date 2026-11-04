@@ -144,17 +144,14 @@ def probe(cfg=None):
                 "hevc_videotoolbox", "libx264", "libx265"):
         out["encoders"][enc] = _encoder_works(ffmpeg, enc)
 
-    smi = Path(os.environ.get("SystemRoot", "C:/Windows")) / "System32" / "nvidia-smi.exe"
-    exe = str(smi) if smi.exists() else "nvidia-smi"
-    try:
-        q = subprocess.run([exe, "--query-gpu=name,driver_version,memory.total",
-                            "--format=csv,noheader"],
-                           capture_output=True, text=True, timeout=15)
-        if q.returncode == 0 and q.stdout.strip():
-            name, drv, mem = [x.strip() for x in q.stdout.strip().split(",")]
-            out["gpu"] = {"name": name, "driver": drv, "memory": mem}
-    except Exception:
-        pass
+    # nvidia-smi is on PATH on Linux (the container toolkit mounts it in) and
+    # in System32 on Windows; `gpus` looks in both, and copes with more than one
+    # card, which the old single-line parse did not.
+    from . import encoders
+    found = encoders.gpus()
+    if found:
+        out["gpu"] = found[0]
+        out["gpu"]["nvenc_profile"] = encoders.profile_for(found[0]["name"])
     return out
 
 

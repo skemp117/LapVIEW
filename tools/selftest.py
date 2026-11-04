@@ -3309,6 +3309,177 @@ def t_library_bulk_selection():
                 "nothing, deleting the 1 leaves 3")
 
 
+# ------------------------------------------------- environment and encoders
+
+def t_env_overrides_config():
+    """LAPVIEW_* variables configure a container; unset, nothing changes."""
+    env_of = config_mod.apply_env
+    assert env_of(CONFIG, {}) == CONFIG, "an empty environment changed CONFIG"
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp).resolve()
+        cfg = config_mod.load(env_of(CONFIG, {"LAPVIEW_DATA_DIR": tmp}))
+        for key, sub in (("library_dir", "library"), ("output_dir", "output"),
+                         ("cache_dir", "cache"), ("inbox_dir", "inbox")):
+            got = Path(getattr(cfg, key))
+            assert got == base / sub, "%s is %s" % (key, got)
+            assert got.is_absolute(), "%s depends on the working dir" % key
+        assert Path(cfg.maps_dir) == (ROOT / CONFIG["maps_dir"]).resolve(), \
+            "with no maps/ under the data dir, the shipped maps should be used"
+        (base / "maps").mkdir()
+        cfg = config_mod.load(env_of(CONFIG, {"LAPVIEW_DATA_DIR": tmp}))
+        assert Path(cfg.maps_dir) == base / "maps"
+        own = base / "elsewhere"
+        cfg = config_mod.load(env_of(CONFIG, {"LAPVIEW_DATA_DIR": tmp,
+                                              "LAPVIEW_LIBRARY_DIR": str(own)}))
+        assert Path(cfg.library_dir) == own, "the specific override must win"
+
+    cfg = config_mod.load(env_of(CONFIG, {"LAPVIEW_ENCODER": "libx264"}))
+    assert (cfg.encode.encoder, cfg.encode.preset) == ("libx264", "medium")
+    cfg = config_mod.load(env_of(CONFIG, {"LAPVIEW_ENCODER": "h264_nvenc",
+                                          "LAPVIEW_NVENC_PROFILE": "pascal",
+                                          "LAPVIEW_NVENC_TEMPORAL_AQ": "0"}))
+    assert cfg.encode.encoder == "h264_nvenc" and cfg.encode.preset == "p7"
+    assert cfg.encode.nvenc_profile == "pascal" and not cfg.encode.temporal_aq
+    for bad in ({"LAPVIEW_ENCODER": "av1_nvenc"},
+                {"LAPVIEW_NVENC_PROFILE": "kepler"},
+                {"LAPVIEW_NVENC_TEMPORAL_AQ": "maybe"},
+                {"LAPVIEW_CPU_FALLBACK": "x266"}):
+        try:
+            config_mod.load(env_of(CONFIG, bad))
+        except config_mod.ConfigError:
+            continue
+        raise AssertionError("%s was accepted" % bad)
+    return ("unset is a no-op; data dir, per-dir and encoder overrides apply; "
+            "4 bad values rejected")
+
+
+def _enc(**kw):
+    cfg = config_mod.load(copy.deepcopy(CONFIG))
+    for k, v in kw.items():
+        setattr(cfg.encode, k, v)
+    return cfg
+
+
+def _pairs(args):
+    return {args[i]: args[i + 1] for i in range(0, len(args) - 1)
+            if args[i].startswith("-")}
+
+
+def t_pascal_args_are_safe():
+    """A GTX 10-series refuses HEVC B-frames and B-frame references.
+
+    Pascal's NVENC opens no session that asks for them, so the profile has to
+    leave them out -- in the export and in the import's re-encode alike -- and
+    a Turing-or-newer card keeps the tuned settings.
+    """
+    from racechrono import encoders, ingest as ingest_mod
+    modern = _pairs(render.encoder_args(_enc(nvenc_profile="turing").encode))
+    assert modern["-bf"] == "3" and modern["-b_ref_mode"] == "middle", modern
+    hevc = _pairs(render.encoder_args(_enc(nvenc_profile="pascal").encode))
+    assert hevc["-bf"] == "0" and "-b_ref_mode" not in hevc, hevc
+    h264 = _pairs(render.encoder_args(
+        _enc(encoder="h264_nvenc", nvenc_profile="pascal").encode))
+    assert h264["-bf"] == "3" and "-b_ref_mode" not in h264, h264
+
+    names = {"NVIDIA GeForce GTX 1070": "pascal",
+             "NVIDIA GeForce GTX 1070 with Max-Q Design": "pascal",
+             "Quadro P2000": "pascal", "Tesla P4": "pascal",
+             "NVIDIA GeForce GTX 980": "pascal",
+             "NVIDIA GeForce RTX 4090": "turing",
+             "NVIDIA GeForce GTX 1660 SUPER": "turing", "NVIDIA L4": "turing"}
+    for name, want in names.items():
+        assert encoders.profile_for(name) == want, name
+
+    opt = ingest_mod.Options()
+    got = opt.video_args("hevc_nvenc", "pascal")
+    assert _pairs(got).get("-bf") == "0", got
+    for enc, tagged in (("hevc_nvenc", True), ("libx265", True),
+                        ("h264_nvenc", False), ("libx264", False)):
+        args = opt.video_args(enc, "pascal")
+        assert (_pairs(args).get("-tag:v") == "hvc1") == tagged, (enc, args)
+        if "h264" in enc or "264" in enc:
+            assert "-bf" not in args, args
+    return ("pascal: HEVC -bf 0, no b_ref_mode; ingest HEVC tagged hvc1; "
+            "%d card names classified" % len(names))
+
+
+def t_encoder_falls_back():
+    """The startup probe settles on something that opens, best first."""
+    from racechrono import encoders
+
+    def runner(fails):
+        seen = []
+
+        def run(cmd):
+            seen.append(cmd)
+            text = " ".join(cmd)
+            return (not any(f(text) for f in fails), "simulated failure")
+        run.seen = seen
+        return run
+
+    # A GTX 1070 with no HEVC temporal AQ: the pascal profile from the name,
+    # then the same encoder again without temporal AQ.
+    cfg = _enc()
+    run = runner([lambda t: "-temporal-aq 1" in t])
+    got = encoders.resolve(cfg, runner=run, ffmpeg="ffmpeg",
+                           gpu_list=[{"name": "NVIDIA GeForce GTX 1070"}])
+    first = _pairs(run.seen[0])
+    assert first["-bf"] == "0" and "-b_ref_mode" not in first, first
+    assert cfg.encode.encoder == "hevc_nvenc" and not cfg.encode.temporal_aq
+    assert got["profile"] == "pascal" and got["fallback"], got
+
+    # An unnamed card that refuses B-frame references drops to pascal.
+    cfg = _enc()
+    run = runner([lambda t: "-b_ref_mode" in t])
+    got = encoders.resolve(cfg, runner=run, ffmpeg="ffmpeg", gpu_list=[])
+    assert (cfg.encode.encoder, cfg.encode.nvenc_profile) == ("hevc_nvenc",
+                                                              "pascal"), got
+
+    # No GPU at all: the CPU, same codec, with an x26x preset and no CUDA.
+    for asked, want in (("hevc_nvenc", "libx265"), ("h264_nvenc", "libx264")):
+        cfg = _enc(encoder=asked)
+        got = encoders.resolve(cfg, runner=runner([lambda t: "nvenc" in t]),
+                               ffmpeg="ffmpeg", gpu_list=[])
+        e = cfg.encode
+        assert (e.encoder, e.preset, e.hwaccel_decode) == (want, "medium",
+                                                           False), got
+        config_mod.EncodeCfg(**{f.name: getattr(e, f.name) for f in
+                                config_mod.fields(e)}).validate()
+        assert render.encoder_args(e)[:2] == ["-preset", "medium"]
+
+    # Fallback switched off: nothing is quietly swapped.
+    cfg = _enc(cpu_fallback="none")
+    got = encoders.resolve(cfg, runner=runner([lambda t: "nvenc" in t]),
+                           ffmpeg="ffmpeg", gpu_list=[])
+    assert cfg.encode.encoder == "hevc_nvenc" and not got.get("chosen"), got
+
+    # A CPU encoder asked for is tested once and kept.
+    cfg = _enc(encoder="libx264", preset="medium")
+    run = runner([])
+    encoders.resolve(cfg, runner=run, ffmpeg="ffmpeg")
+    assert len(run.seen) == 1 and cfg.encode.encoder == "libx264"
+    return "temporal AQ, pascal, CPU (hevc and h264), off and CPU-asked paths"
+
+
+def t_real_probe_settles():
+    """On this machine, with its real ffmpeg: whatever is chosen opens."""
+    from racechrono import encoders
+    try:
+        video.find_binary("ffmpeg")
+    except FileNotFoundError:
+        raise Skip("no ffmpeg here")
+    cfg = _enc()
+    got = encoders.resolve(cfg)
+    assert got.get("chosen"), got
+    # The pascal arguments are a subset of what any newer card takes, so on a
+    # newer card they must open too -- which checks the syntax ffmpeg is given.
+    forced = _enc(nvenc_profile="pascal")
+    got2 = encoders.resolve(forced)
+    assert got2.get("chosen"), got2
+    return "%s; forced pascal: %s" % (encoders.describe(cfg.encode, got),
+                                      encoders.describe(forced.encode))
+
+
 # ------------------------------------------------------------ web server
 
 def _server_library(tmp, **kw):
@@ -3466,6 +3637,11 @@ def main():
     check("plan structure", t_job_plan_structure)
     check("report is a view of the plan", t_job_plan_matches_text_report)
     check("probe finds a usable encoder", t_job_probe)
+    area("environment and encoders")
+    check("LAPVIEW_* overrides config", t_env_overrides_config)
+    check("pascal arguments are safe", t_pascal_args_are_safe)
+    check("the encoder falls back", t_encoder_falls_back)
+    check("the real probe settles", t_real_probe_settles)
     area("web server")
     check("a reset answers after wiping", t_reset_answers_after_wiping)
 
