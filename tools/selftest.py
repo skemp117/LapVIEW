@@ -4025,6 +4025,84 @@ def t_posts_with_the_header_work():
             "lap(s), all by POST" % n)
 
 
+def _png_size(blob):
+    import struct
+    assert blob[:8] == b"\x89PNG\r\n\x1a\n", "not a PNG"
+    w, h, _depth, colour = struct.unpack(">IIBB", blob[16:26])
+    return w, h, colour
+
+
+def t_home_screen_app():
+    """What an iPhone needs to run the page full screen from its home screen."""
+    import re
+    css = (ROOT / "webui/static/app.css").read_text(encoding="utf-8")
+    with tempfile.TemporaryDirectory() as tmp, \
+            _closing(_server_library(tmp, headless=True)) as app:
+        with _served(app) as call:
+            r, page = call("GET", "/", raw=True)
+            html = page.decode("utf-8")
+            head = html[:html.index("</head>")]
+
+            def meta(name):
+                m = re.search(r'<meta name="%s" content="([^"]*)"' % name, head)
+                assert m, "no <meta name=%s>" % name
+                return m.group(1)
+
+            assert "viewport-fit=cover" in meta("viewport")
+            assert meta("apple-mobile-web-app-capable") == "yes"
+            assert meta("mobile-web-app-capable") == "yes"
+            assert meta("apple-mobile-web-app-title") == "LapVIEW"
+            assert meta("apple-mobile-web-app-status-bar-style") in (
+                "black-translucent", "default")
+            theme = meta("theme-color")
+            links = dict(re.findall(r'<link rel="([^"]+)"[^>]*href="([^"]+)"',
+                                    head))
+            assert links.get("manifest") == "/manifest.webmanifest", links
+            touch = links.get("apple-touch-icon", "")
+            assert touch.endswith(".png"), "iOS ignores a non-PNG touch icon"
+
+            r, raw = call("GET", "/manifest.webmanifest", raw=True)
+            assert r.status == 200, r.status
+            ctype = r.getheader("Content-Type")
+            assert ctype == "application/manifest+json", ctype
+            m = json.loads(raw)
+            for key, want in (("name", "LapVIEW"), ("short_name", "LapVIEW"),
+                              ("start_url", "/"), ("scope", "/"),
+                              ("display", "standalone")):
+                assert m.get(key) == want, (key, m.get(key))
+            palette = dict(re.findall(r"--(\w+):\s*(#[0-9a-fA-F]{6})", css))
+            assert m["background_color"] == palette["bg"], m["background_color"]
+            assert m["theme_color"] == palette["panel"] == theme, (
+                m["theme_color"], theme)
+
+            icons = list(m["icons"]) + [{"src": touch, "sizes": "180x180",
+                                         "purpose": "apple-touch-icon"}]
+            seen = set()
+            for icon in icons:
+                r, blob = call("GET", icon["src"], raw=True)
+                assert r.status == 200, icon["src"]
+                assert r.getheader("Content-Type") == "image/png", \
+                    (icon["src"], r.getheader("Content-Type"))
+                assert "max-age=" in (r.getheader("Cache-Control") or ""), \
+                    (icon["src"], r.getheader("Cache-Control"))
+                w, h, colour = _png_size(blob)
+                assert "%dx%d" % (w, h) == icon["sizes"], (icon, w, h)
+                if icon["purpose"] in ("maskable", "apple-touch-icon"):
+                    # Full bleed: nothing transparent for a mask, or iOS's
+                    # black fill, to find.
+                    assert colour == 2, (icon["src"], "has alpha")
+                seen.add((icon["purpose"], w))
+            assert {("any", 192), ("any", 512), ("maskable", 512),
+                    ("apple-touch-icon", 180)} <= seen, seen
+            r, _ = call("GET", "/static/app.css", raw=True)
+            assert r.getheader("Cache-Control") == "no-store", \
+                "the stylesheet is cached; an edit would not show"
+    for side in ("top", "right", "bottom", "left"):
+        assert "env(safe-area-inset-%s" % side in css, side
+    return ("iOS tags present; manifest served as %s; %d icons as cached "
+            "image/png; safe-area insets used" % (ctype, len(icons)))
+
+
 def t_headless_is_decided():
     from webui import server as srv_mod
     hd = srv_mod.headless_default
@@ -4177,6 +4255,7 @@ def main():
     check("changes need a POST with the header",
           t_side_effects_need_a_post)
     check("POSTs with the header do the work", t_posts_with_the_header_work)
+    check("the page can run from a home screen", t_home_screen_app)
 
     print()
     if _TIMING:

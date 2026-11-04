@@ -6,7 +6,8 @@
 
 Routes
     GET  /                              the app shell
-    GET  /static/<name>                 page assets
+    GET  /static/<name>                 page assets; icons/ are cached a day
+    GET  /manifest.webmanifest          the home-screen app manifest
     GET  /api/library                   tracks, days and laps: the whole tree
     GET  /api/laps?track=&day=          laps, filtered
     GET  /api/lap/<id>                  one lap: channels, map, driven line, video
@@ -1195,6 +1196,13 @@ UPLOAD_ROUTES = ("/api/upload/folder", "/api/upload/begin",
                  "/api/upload/abort", "/api/inbox/delete")
 POST_ONLY = frozenset(ACTIONS + UPLOAD_ROUTES)
 
+# Types `mimetypes` does not know everywhere. On Windows it reads the registry,
+# which may not have `.webmanifest` at all.
+_TYPES = {".webmanifest": "application/manifest+json", ".png": "image/png"}
+# The home-screen icons change about never, and a phone fetches them again for
+# every page otherwise. The rest of /static stays uncached, so an edit shows.
+_ICON_CACHE = "public, max-age=86400"
+
 
 def _text(v):
     """A JSON value as the string its query parameter would have been."""
@@ -1241,13 +1249,13 @@ class Handler(BaseHTTPRequestHandler):
             sys.stderr.write("  %s\n" % (fmt % args))
 
     # -- helpers ---------------------------------------------------------
-    def _send(self, code, body, ctype, extra=None):
+    def _send(self, code, body, ctype, extra=None, cache="no-store"):
         if isinstance(body, str):
             body = body.encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
+        self.send_header("Cache-Control", cache)
         for k, v in (extra or {}).items():
             self.send_header(k, v)
         self.end_headers()
@@ -1497,6 +1505,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._static("index.html")
         if route.startswith("/static/"):
             return self._static(route[len("/static/"):])
+        if route == "/manifest.webmanifest":
+            # At the root, where its scope is the whole app.
+            return self._static("manifest.webmanifest")
 
         if route == "/api/config":
             return self._json(lib.client_config())
@@ -1611,10 +1622,14 @@ class Handler(BaseHTTPRequestHandler):
         target = (STATIC / name).resolve()
         if STATIC.resolve() not in target.parents or not target.is_file():
             return self._fail(404, "no such asset: %s" % name)
-        ctype = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+        ctype = (_TYPES.get(target.suffix.lower())
+                 or mimetypes.guess_type(target.name)[0]
+                 or "application/octet-stream")
         if ctype.startswith("text/") or target.suffix in (".js", ".json"):
             ctype += "; charset=utf-8"
-        self._send(200, target.read_bytes(), ctype)
+        icon = target.parent == (STATIC / "icons").resolve()
+        self._send(200, target.read_bytes(), ctype,
+                   cache=_ICON_CACHE if icon else "no-store")
 
     def _serve_file(self, path, download=False):
         """Serve a file with byte-range support.

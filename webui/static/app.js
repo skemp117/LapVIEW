@@ -1842,6 +1842,12 @@ function exportActions(f) {
     a.className = 'act';
     a.href = f.url;
     a.setAttribute('download', f.name || '');
+    /* A browser saves it and stays put. Run full screen from an iPhone's home
+     * screen there is no back button, and if that WebKit ignores `download`
+     * the file opens in a sheet with a Done button rather than replacing the
+     * app. */
+    a.target = '_blank';
+    a.rel = 'noopener';
     a.textContent = 'download';
     acts.appendChild(a);
   }

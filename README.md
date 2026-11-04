@@ -166,6 +166,20 @@ curl -X POST -H 'X-LapVIEW: 1' -H 'Content-Type: application/json' \
      -d '{"confirm": "yes"}' http://<server>:8770/api/library/reset
 ```
 
+### Add to Home Screen
+
+On an iPhone, open the app in Safari (`http://<server>:8770`), tap **Share**,
+then **Add to Home Screen**. The icon opens LapVIEW full screen, with no Safari
+toolbar. The header and footer keep clear of the notch and the home indicator,
+in portrait and in landscape. If the server is on a tailnet, Tailscale has to be
+on, as it does in Safari.
+
+It is still the live page on the server, not an offline copy. Working offline
+would need a service worker, and browsers only allow those over HTTPS, while
+this app is plain HTTP. So there is no service worker. To reload the app, close
+it in the app switcher and open it again. The icons are drawn by
+`tools/make_icons.py`.
+
 **Health.** `GET /api/health` reports the encoder that was chosen and why, the
 ffmpeg it found, whether each data folder is writable, and free space. It
 answers 503 if ffmpeg is missing or a folder is not writable; the image's

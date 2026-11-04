@@ -182,6 +182,22 @@ def main():
            "%d B of HTML" % len(page))
         st, ctype, css = get(base, "/static/app.css", want_json=False)
         ok("the stylesheet is served", st == 200 and "css" in ctype, ctype)
+        ok("the page links its manifest and touch icon",
+           b'rel="manifest"' in page and b'rel="apple-touch-icon"' in page)
+        st, ctype, man = get(base, "/manifest.webmanifest", want_json=False)
+        man = json.loads(man)
+        ok("the manifest is served",
+           st == 200 and ctype == "application/manifest+json"
+           and man.get("display") == "standalone", ctype)
+        icons = [i["src"] for i in man.get("icons", [])] + [
+            "/static/icons/apple-touch-icon.png"]
+        types = set()
+        for src in icons:
+            with urllib.request.urlopen(base + src, timeout=30) as r:
+                types.add((r.status, r.headers.get("Content-Type"),
+                           "max-age" in (r.headers.get("Cache-Control") or "")))
+        ok("the icons are served", types == {(200, "image/png", True)},
+           "%d icon(s): %s" % (len(icons), sorted(types)))
 
         st, _, laps = get(base, "/api/laps")
         ok("laps list", st == 200 and laps["laps"], "%d lap(s)" % len(laps["laps"]))
