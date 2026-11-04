@@ -160,12 +160,29 @@ def test_cmd(ffmpeg, enc, out="-"):
     return cmd + [str(out)]
 
 
+def _why(err):
+    """The line of ffmpeg's stderr that says what went wrong.
+
+    Its last line is usually a consequence ("Nothing was written into output
+    file"); the cause is the one naming NVENC or CUDA, or failing that the
+    first error.
+    """
+    lines = [l.strip() for l in (err or "").splitlines() if l.strip()]
+    if not lines:
+        return "no message"
+    for keys in (("nvenc", "cuda", "cannot load"), ("error", "invalid")):
+        hit = next((l for l in lines if any(k in l.lower() for k in keys)), None)
+        if hit:
+            return hit
+    return lines[-1]
+
+
 def _run(cmd, timeout=60):
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     except Exception as exc:
         return False, "%s: %s" % (type(exc).__name__, exc)
-    return r.returncode == 0, (r.stderr or "").strip()[-600:]
+    return r.returncode == 0, (r.stderr or "").strip()[-4000:]
 
 
 def _candidates(enc):
@@ -248,8 +265,7 @@ def resolve(cfg, log=None, runner=None, gpu_list=None, ffmpeg=None):
             if ok:
                 chosen = (label, cand)
                 break
-            last = (err or "no message").strip().splitlines() or [""]
-            notes.append("%s %s failed: %s" % (cand.encoder, label, last[-1]))
+            notes.append("%s %s failed: %s" % (cand.encoder, label, _why(err)))
         if chosen and chosen[1].is_nvenc and chosen[1].hwaccel_decode:
             ok, err = (True, "") if runner else _hwaccel_works(exe, chosen[1])
             if not ok:
