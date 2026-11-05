@@ -22,7 +22,8 @@ Routes
     GET  /api/survey?path=              how many files a folder holds
     GET  /api/import/review             what the last import produced
     GET  /api/browse?path=              folders under a path, for the picker
-    GET  /api/import?source=&...        what importing that folder would do
+    GET  /api/import?source=&...        what importing that folder would do,
+                                        and the names to offer (`suggest`)
     GET  /api/import/progress           how the running import is going
     GET  /api/config                    paths, server mode, upload limits
     GET  /api/health                    ffmpeg, encoder, writable data dirs
@@ -583,19 +584,107 @@ class Library:
         re-reads: classifying and identifying 19 sessions is about 12 s, and
         `apply_filters` on the result is instant. The import screen is a lot of
         checkboxes, and a 12 s pause on each one would make it unusable.
+
+        The cache is keyed on more than the folder's path. A phone adds to an
+        upload folder in two goes -- the CSV from Files, then the video from
+        Photos -- and a plan made between them has no footage in it. And the
+        track options decide which sessions go where and what a new track is
+        called when the plan is made, so a plan made without them (the preview)
+        is not the plan an import that names the track should run.
         """
         from racechrono import ingest as ingest_mod
         src = str(Path(source).expanduser())
+        key = (src, _folder_signature(src),
+               options.track_id if options else "",
+               options.track_name if options else "")
         with self._lock:
-            if self._plan is None or self._plan_source != src:
+            if self._plan is None or self._plan_source != key:
                 self._plan = ingest_mod.plan(
                     self.cfg, self.library(), source=src,
                     options=options or ingest_mod.Options(), verbose=False)
-                self._plan_source = src
+                self._plan_source = key
             elif options is not None:
                 self._plan.options = options
                 ingest_mod.apply_filters(self._plan)
             return self._plan
+
+    def suggest(self, p):
+        """Names for importing a plan in one tap, and whether it can be one.
+
+        The import route insists on an event and a track, because a library is
+        only worth keeping if its names mean something. From a phone, typing
+        them is most of the work, so this offers the likeliest ones and the
+        page shows them, editable, beside a single Import button:
+
+        * the track is whatever the plan settled on: a library track the
+          sessions were matched to by shape, or the CSV's `Track name` for a
+          new one;
+        * the event is the one already filed on that date, if there is one --
+          the second upload of a day belongs with the first -- or else the
+          CSV's `Session title` with the date, so next month's session at the
+          same place does not land in this month's event.
+
+        `ready` means one tap can import it: one track, and something to keep.
+        `auto` means nothing about it needs a person to look first -- no
+        session without footage, no problems -- which is when the page may
+        import without being asked, if it has been told to.
+        """
+        out = {"ready": False, "auto": False, "waiting": False, "why": "",
+               "event": "", "track_id": "", "track_name": "", "track_new": False,
+               "sessions": len(p.sessions), "laps": 0, "laps_video": 0,
+               "dates": sorted({sp.date for sp in p.sessions}),
+               "no_video": [], "problems": []}
+        if not p.sessions:
+            if p.already:
+                out["why"] = ("everything in this upload is already in the "
+                              "library")
+            elif p.skipped:
+                out["why"] = "could not read %s: %s" % p.skipped[0]
+            else:
+                # The video from Photos came up first; the CSV is next.
+                out["waiting"] = True
+                out["why"] = ("no RaceChrono CSV in this upload yet: add it "
+                              "from Files")
+            return out
+        kept = p.kept()
+        out["laps"] = len(kept)
+        out["laps_video"] = sum(1 for _sp, lp in kept if lp.has_video)
+        out["no_video"] = [
+            {"session": sp.stem, "t0": sp.run.t0,
+             "duration": round(sp.run.duration, 1)}
+            for sp in p.sessions if not any(lp.has_video for lp in sp.laps)]
+        out["problems"] = ["%s: %s" % (sp.stem, why)
+                           for sp in p.sessions for why in sp.problems]
+
+        first = min(p.sessions, key=lambda sp: sp.run.t0)
+        if len(p.tracks) == 1:
+            tp = p.tracks[0]
+            out["track_name"] = tp.name
+            out["track_new"] = tp.existing_id is None
+            out["track_id"] = tp.existing_id or ""
+        else:
+            out["why"] = ("this upload covers %d tracks; name them in the "
+                          "import form" % len(p.tracks))
+
+        lib = self.library()
+        events = {e["id"]: e["name"] for e in lib.events()}
+        filed = [d for d in lib.days()
+                 if d["date"] in out["dates"] and d["event_id"] in events]
+        same = [d for d in filed if d["track_id"] == out["track_id"]]
+        if same or filed:
+            out["event"] = events[(same or filed)[0]["event_id"]]
+        else:
+            title = _meta(first.run, "Session title") or out["track_name"] \
+                or _meta(first.run, "Track name")
+            out["event"] = ("%s %s" % (title, first.date)).strip()
+
+        if not out["laps"]:
+            out["why"] = out["why"] or "no lap or run to keep in this upload"
+        out["ready"] = not out["why"] and bool(out["event"]) \
+            and bool(out["track_id"] or out["track_name"])
+        out["auto"] = (out["ready"] and not out["no_video"]
+                       and not out["problems"])
+        return out
 
     def import_payload(self, source, options=None):
         """The plan as JSON, for the import screen."""
@@ -653,6 +742,7 @@ class Library:
             "estimate": est,
             "options": _options_dict(p.options),
             "library": self.library().summary(),
+            "suggest": self.suggest(p),
         }
 
     def survey(self, source):
@@ -1106,6 +1196,37 @@ def pick_folder(timeout=600):
         return {"cancelled": True}
     return {"path": str(Path(path))}
 
+
+
+def _folder_signature(source):
+    """What an import would read from a folder, as one comparable value.
+
+    Name, size and modification time of every CSV and video under it, which
+    changes when a file is added, removed or replaced, and costs a directory
+    walk -- nothing is opened.
+    """
+    root = Path(source)
+    if not root.is_dir():
+        return ()
+    wanted = set(video.VIDEO_EXTS) | {".csv"}
+    sig = []
+    for dirpath, dirnames, files in os.walk(root):
+        dirnames.sort()
+        for name in sorted(files):
+            if os.path.splitext(name)[1].lower() not in wanted:
+                continue
+            try:
+                st = os.stat(os.path.join(dirpath, name))
+            except OSError:
+                continue
+            sig.append((os.path.relpath(os.path.join(dirpath, name), root),
+                        st.st_size, st.st_mtime_ns))
+    return tuple(sig)
+
+
+def _meta(run, key):
+    """One line of a CSV's header block, unquoted, or ''."""
+    return (run.meta.get(key) or "").strip().strip('"').strip()
 
 
 def _writable(path):

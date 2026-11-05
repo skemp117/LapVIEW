@@ -4025,6 +4025,95 @@ def t_posts_with_the_header_work():
             "lap(s), all by POST" % n)
 
 
+def t_upload_offers_a_one_tap_import():
+    """An upload says what importing it would do, and what to call things.
+
+    The phone's order: the CSV from Files first, the video from Photos second,
+    into the same folder. The first check has to see no footage and say so --
+    not `auto` -- and the second has to see the footage, which a plan cached
+    by folder path alone never did. The names it offers have to be ones the
+    import route takes as they are, and a later upload from the same day has
+    to be offered the event the first one was filed under.
+    """
+    from urllib.parse import quote
+
+    def offer(call, folder):
+        r, got = call("GET", "/api/import?source=" + quote(folder) +
+                      "&video=0&pad=3&cq=28")
+        assert r.status == 200, got
+        return got["suggest"]
+
+    def run(call, body):
+        r, got = call("POST", "/api/import/run", body)
+        assert r.status == 200, got
+        deadline = time.time() + 180
+        while True:
+            r, job = call("GET", "/api/import/progress")
+            if job["state"] != "running" or time.time() > deadline:
+                return job
+            time.sleep(0.2)
+
+    with tempfile.TemporaryDirectory() as tmp, \
+            _closing(_server_library(tmp, headless=True)) as app:
+        app.inbox.ensure()
+        phone = app.inbox_dir() / "phone"
+        phone.mkdir()
+        (app.inbox_dir() / "clip").mkdir()
+        shutil.copy(SOURCE / "split_a.mp4", app.inbox_dir() / "clip")
+        shutil.copy(SOURCE / "circuit_5laps.csv", phone)
+        with _served(app) as call:
+            s = offer(call, "clip")
+            assert s["waiting"] and not s["ready"] and "CSV" in s["why"], s
+            s = offer(call, "phone")
+            assert s["ready"] and not s["auto"], s
+            assert s["track_new"] and s["track_name"] == "AMP Full", s
+            assert s["event"] == "AMP Full 2026-08-19", s
+            assert [n["session"] for n in s["no_video"]] == ["circuit_5laps"]
+            assert s["laps"] == 5 and s["laps_video"] == 0, s
+
+            for clip in ("split_a.mp4", "split_b.mp4"):
+                shutil.copy(SOURCE / clip, phone)
+            s = offer(call, "phone")
+            assert not s["no_video"] and s["laps_video"] > 0, \
+                "the plan from before the video arrived was served again: %s" % s
+            assert s["auto"], s
+
+            # What the card sends: the form's options, the offered names, and
+            # the track by name.
+            job = run(call, {"source": "phone", "video": "0", "pad": "3",
+                             "cq": "28", "event": s["event"],
+                             "track": s["track_name"]})
+            assert job["state"] == "done", job
+            tree = app.tree()["tracks"]
+            assert [t["name"] for t in tree] == ["AMP Full"], tree
+            assert tree[0]["days"][0]["event"] == "AMP Full 2026-08-19"
+
+            again = offer(call, "phone")
+            assert not again["ready"] and "already" in again["why"], again
+
+            # Two uploads from one day: the second is offered the first's
+            # event, and the track it was matched to by shape.
+            for name, csv_name in (("run1", "autocross_run1.csv"),
+                                   ("run2", "autocross_run2.csv")):
+                (app.inbox_dir() / name).mkdir()
+                shutil.copy(SOURCE / csv_name, app.inbox_dir() / name)
+            s1 = offer(call, "run1")
+            assert s1["track_new"] and s1["event"] == "Grip 8-22 2026-08-22", s1
+            job = run(call, {"source": "run1", "video": "0",
+                             "event": "Grip Season 5 - Event 6",
+                             "track": "Grip S5E6"})
+            assert job["state"] == "done", job
+            s2 = offer(call, "run2")
+            grip = next(t for t in app.tree()["tracks"]
+                        if t["name"] == "Grip S5E6")
+            assert not s2["track_new"] and s2["track_id"] == grip["id"], s2
+            assert s2["track_name"] == "Grip S5E6", s2
+            assert s2["event"] == "Grip Season 5 - Event 6", s2
+    return ("CSV alone: ready, no footage, not auto; video added: auto; "
+            "the offered names import as given; a later upload from that day "
+            "gets the day's event and the matched track")
+
+
 def _png_size(blob):
     import struct
     assert blob[:8] == b"\x89PNG\r\n\x1a\n", "not a PNG"
@@ -4255,6 +4344,8 @@ def main():
     check("changes need a POST with the header",
           t_side_effects_need_a_post)
     check("POSTs with the header do the work", t_posts_with_the_header_work)
+    check("an upload offers a one-tap import",
+          t_upload_offers_a_one_tap_import)
     check("the page can run from a home screen", t_home_screen_app)
 
     print()

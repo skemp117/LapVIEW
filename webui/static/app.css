@@ -618,6 +618,24 @@ a.act { text-decoration: none; }
 .upfile.done .progress > i { background: var(--good); }
 .upfile.bad .nm, .upfile.bad .st { color: var(--bad); }
 
+/* What importing the upload would do, and the one button that does it. */
+#upReady {
+  display: flex; flex-direction: column; gap: 6px;
+  margin: 12px auto 0; padding: 12px 14px; width: min(100%, 34rem);
+  border: 1px solid var(--accent); border-radius: 8px; background: var(--bg);
+}
+#qHead { font-size: 16px; font-weight: 600; overflow-wrap: anywhere; }
+#qMeta { font-size: 12px; }
+#qWarn { font-size: 12px; display: flex; flex-direction: column; gap: 4px; }
+#qWarn:empty { display: none; }
+#qNames { display: flex; flex-direction: column; gap: 6px; }
+#qNames .opt.field > .lbl { flex: 0 0 6em; }
+#qNames input { flex: 1 1 auto; }
+#impApp #upReady .cmprow { justify-content: flex-start; margin-top: 4px;
+                           flex-wrap: wrap; }
+#qBar { height: 6px; margin: 0; }
+#qAutoRow { font-size: 12px; color: var(--dim); }
+
 #upFolders { margin-top: 12px; display: flex; flex-direction: column; gap: 2px; }
 #upFolders .opthead { margin-bottom: 4px; }
 .upfolder, .expfile.saved {
@@ -633,7 +651,9 @@ a.act { text-decoration: none; }
 /* Below 16 px, Safari on a phone zooms the page into whatever field is tapped
    and leaves it zoomed. These are the fields an upload-then-import touches. */
 @media (max-width: 54em) {
-  #upName, #srcPath, #optEvent, #optTrackName { font-size: 16px; }
+  #upName, #srcPath, #optEvent, #optTrackName, #qEvent, #qTrack {
+    font-size: 16px;
+  }
   label.btn.big, button.big { padding: 9px 20px; }
 }
 

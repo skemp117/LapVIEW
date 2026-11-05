@@ -132,14 +132,26 @@ Everything it keeps is under `/data`:
 | `/data/cache/` | scratch for exports |
 | `/data/maps/` | optional; without it the maps shipped in `Maps/` are used |
 
-**Uploading.** The library tab has an upload card. Choose files (on an iPhone,
-from Photos or Files; a camera's `.insv`/`.lrv` may need "choose any file type"),
-or drag them in on a desktop. Each file goes up in 8 MB chunks that are retried
-if the connection drops, and lands in the folder only when all of it has
-arrived. Then **Import this upload** fills in the import box with that folder;
-name the event and track and press Import as usual. Keep the page open and the
+**Uploading.** In server mode the upload card is the first thing on the
+library tab (`/#add` opens it directly). Choose files (on an iPhone, from
+Photos or Files; a camera's `.insv`/`.lrv` may need "choose any file type"),
+or drag them in on a desktop. Choosing again adds to the same upload, which is
+how a phone sends the RaceChrono CSV from Files and the video from Photos. Each
+file goes up in 8 MB chunks that are retried if the connection drops, and lands
+in the folder only when all of it has arrived. Keep the page open and the
 screen on while it uploads (the page asks the phone to keep the screen awake).
 Uploads that were imported can be deleted from the same card.
+
+**One-tap import.** When an upload finishes, the server plans the import
+(writing nothing) and the card shows the result: the track (a library track the
+sessions matched by shape, or the CSV's `Track name` for a new one), the laps,
+how many have video, and an event name. The event is the one already filed on
+that date if there is one, otherwise the CSV's `Session title` with the date.
+Both names can be edited. **Import** runs it with the import form's current
+options, and **more options** opens the full form. A session with no matching
+video, or a session that fits no track, is reported on the card. With **import
+by itself** ticked (remembered per browser), an upload that has a CSV, its
+video and no problems is imported with no tap at all.
 
 **Exports** have a **download** link (byte ranges, so a dropped phone download
 resumes), and files from earlier sessions are listed too. "Show in folder" and

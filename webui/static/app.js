@@ -2507,6 +2507,14 @@ async function runImport() {
                $('optEvent').value.trim() + '\nTrack: ' + where +
                '\n\nNothing in that folder is moved, changed or deleted. ' +
                'Re-encoding video takes a while.')) return;
+  const q = importOptions();
+  q.set('source', S.src);
+  return startImport(q);
+}
+
+/* Start an import with every option already decided, and follow it. Shared by
+ * the import form and the upload card's one button. True if it started. */
+async function startImport(q) {
   $('impRun').disabled = true;
   S.impDone = false;
   impStep('working');
@@ -2514,8 +2522,6 @@ async function runImport() {
   $('impBar').style.width = '0';
   $('impDetail').textContent = '';
   impStatus('');
-  const q = importOptions();
-  q.set('source', S.src);
   let d;
   try {
     d = await postJSON('/api/import/run', Object.fromEntries(q));
@@ -2526,9 +2532,11 @@ async function runImport() {
     impStep('choose');
     $('impRun').disabled = false;
     impStatus(d.error);
-    return;
+    quickJob({ state: 'failed', error: d.error });
+    return false;
   }
   pollImport();
+  return true;
 }
 
 async function pollImport() {
@@ -2541,6 +2549,7 @@ async function pollImport() {
     setTimeout(pollImport, 2000);
     return;
   }
+  quickJob(job);
   if (job.state === 'running') {
     $('impPhase').textContent = job.phase || 'working';
     /* Reading the folder and building the maps come before any lap is cut, so
@@ -2853,6 +2862,8 @@ async function uploadFiles(list) {
   }
   $('upName').disabled = true;
   $('upDone').classList.add('hidden');
+  $('upChoose').textContent = 'Add more to this upload…';
+  Q.seq++;                      // a check of the folder as it was is stale now
   for (const f of files) {
     const ok = upAccepts(f);
     const row = { file: f, state: ok ? 'queued' : 'skipped', received: 0,
@@ -3019,6 +3030,7 @@ function upFinished() {
   const ok = rows.length && rows.every((r) => r.state === 'done');
   $('upDone').classList.toggle('hidden', !ok);
   refreshInbox();
+  if (ok) quickPlan();
 }
 
 /* Safari on a phone stops a page's network traffic when the screen locks. A
@@ -3105,7 +3117,7 @@ async function refreshInbox() {
 }
 
 function resetUpload() {
-  if (UP.running) return;
+  if (UP.running || Q.active) return;
   UP.folder = null;
   UP.label = '';
   UP.rows = [];
@@ -3113,8 +3125,208 @@ function resetUpload() {
   $('upDone').classList.add('hidden');
   $('upName').disabled = false;
   $('upName').value = '';
+  $('upChoose').textContent = 'Choose files…';
+  Q.seq++;
+  Q.folder = null;
+  Q.s = null;
+  $('upReady').classList.add('hidden');
   upSummary();
 }
+
+/* ============================================================ quick import
+ *
+ * From a phone, the import form is most of the work: two names to type and a
+ * dozen options nobody changes at the track. So once an upload is in, the
+ * server plans it -- reading, writing nothing -- and says what an import would
+ * do and what it would call things, and this card offers that as one button.
+ * The names are editable, "more options" is the full form, and anything the
+ * server is unsure of -- a session with no footage, two tracks in one upload,
+ * a session that fits no track -- is said rather than imported quietly.
+ *
+ * "Import by itself" (remembered per browser) skips the button, but only for
+ * an upload the server calls `auto`: nothing missing, nothing odd. The CSV
+ * from Files usually arrives before the video from Photos, and the first
+ * check finds no footage, so it waits for the second.
+ */
+const Q = {
+  seq: 0,          // bumped by anything that makes a check in flight stale
+  folder: null,    // the upload the card describes
+  s: null,         // the server's `suggest` for it
+  active: false,   // an import started from this card is running
+};
+const AUTO_KEY = 'lapview.autoImport';
+
+function quickAuto() {
+  try { return localStorage.getItem(AUTO_KEY) === '1'; } catch (e) {
+    return false;
+  }
+}
+
+function plural(n, word) { return n + ' ' + word + (n === 1 ? '' : 's'); }
+
+function clockOf(unix) {
+  try {
+    return new Date(unix * 1000).toLocaleTimeString([], {
+      hour: 'numeric', minute: '2-digit' });
+  } catch (e) { return ''; }
+}
+
+async function quickPlan() {
+  if (!UP.folder || UP.running || Q.active) return;
+  const seq = ++Q.seq;
+  const folder = UP.folder;
+  Q.folder = folder;
+  Q.s = null;
+  $('upReady').classList.remove('hidden');
+  $('qHead').textContent = 'checking the upload…';
+  $('qMeta').textContent = 'reading the session and matching the footage';
+  $('qWarn').textContent = '';
+  $('qNames').classList.add('hidden');
+  $('qImport').disabled = true;
+  $('qImport').classList.remove('hidden');
+  $('qMore').classList.add('hidden');
+  $('qMore').textContent = 'more options';
+  $('qMore').onclick = quickMore;
+  $('qBar').classList.add('hidden');
+  $('qNote').textContent = '';
+  /* The form's filters, so the lap count is what an import would keep; but
+   * not its names, which would change what the plan calls a new track. */
+  const q = importOptions();
+  for (const k of ['event', 'track', 'track_id']) q.delete(k);
+  q.set('source', folder.path);
+  let d;
+  try {
+    d = await fetch('/api/import?' + q).then((r) => r.json());
+  } catch (e) {
+    d = { error: '' + e };
+  }
+  if (seq !== Q.seq) return;          // more files arrived while it read
+  if (d.error) {
+    $('qHead').textContent = 'could not check the upload';
+    $('qMeta').textContent = d.error;
+    $('qMore').classList.remove('hidden');
+    return;
+  }
+  const s = d.suggest || {};
+  Q.s = s;
+  paintQuick(s);
+  $('upReady').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  if (s.auto && quickAuto()) quickImport();
+}
+
+function paintQuick(s) {
+  $('qHead').textContent = s.track_name
+    ? s.track_name + (s.track_new ? '  ·  new track' : '')
+    : s.sessions ? 'more than one track'
+    : s.waiting ? 'waiting for the CSV' : 'nothing new to import';
+  const bits = [];
+  if (s.sessions) bits.push(plural(s.sessions, 'session'));
+  if (s.laps) {
+    bits.push(plural(s.laps, 'lap'));
+    bits.push(s.laps_video === s.laps ? 'video on every lap'
+      : s.laps_video ? 'video on ' + s.laps_video + ' of ' + s.laps
+      : 'no video');
+  }
+  if (s.dates && s.dates.length) bits.push(s.dates.join(', '));
+  $('qMeta').textContent = bits.join('  ·  ');
+
+  const warn = [];
+  if (s.why) warn.push(s.why);
+  for (const n of (s.no_video || [])) {
+    warn.push('No video found for the ' + clockOf(n.t0) + ' session (' +
+              Math.round(n.duration / 60) + ' min). Add it from Photos with ' +
+              'the button above, or import it without.');
+  }
+  for (const p of (s.problems || [])) warn.push(p);
+  $('qWarn').innerHTML = warn.map((w) => '<div>' + esc(w) + '</div>').join('');
+
+  $('qNames').classList.toggle('hidden', !s.ready);
+  $('qEvent').value = s.event || '';
+  $('qTrackRow').classList.toggle('hidden', !s.track_new);
+  $('qTrack').value = s.track_name || '';
+  $('qImport').disabled = !s.ready;
+  $('qMore').classList.toggle('hidden', !s.sessions);
+  $('qAuto').checked = quickAuto();
+  $('qNote').textContent = s.ready && s.auto && quickAuto()
+    ? 'importing by itself…' : '';
+}
+
+async function quickImport() {
+  const s = Q.s;
+  if (!s || !s.ready || !Q.folder || Q.active) return;
+  const event = $('qEvent').value.trim();
+  const track = s.track_new ? $('qTrack').value.trim() : s.track_name;
+  if (!event) { $('qNote').textContent = 'name the event'; return; }
+  if (!track) { $('qNote').textContent = 'name the track'; return; }
+  /* The track goes by name, not id, even when it is one the library has: the
+   * plan put these sessions there by their shape, and a name only ever names
+   * a track the import creates. An id would put every session on it by hand. */
+  const q = importOptions();
+  q.delete('track_id');
+  q.set('event', event);
+  q.set('track', track);
+  q.set('source', Q.folder.path);
+  Q.active = true;
+  $('qImport').disabled = true;
+  $('qNames').classList.add('hidden');
+  $('qMore').classList.add('hidden');
+  $('qBar').classList.remove('hidden');
+  $('qFill').style.width = '3%';
+  $('qNote').textContent = 'starting…';
+  if (!await startImport(q)) Q.active = false;
+}
+
+/* The import's progress, on the card that started it. */
+function quickJob(job) {
+  if (!Q.active) return;
+  if (job.state === 'running') {
+    $('qFill').style.width = (job.total
+      ? Math.max(3, Math.round(100 * job.done / job.total)) : 3) + '%';
+    $('qNote').textContent = (job.phase || 'working') +
+      (job.total ? ' — ' + job.done + ' of ' + job.total + ' lap(s)' : '');
+    return;
+  }
+  Q.active = false;
+  if (job.state === 'failed') {
+    $('qBar').classList.add('hidden');
+    $('qNames').classList.toggle('hidden', !(Q.s && Q.s.ready));
+    $('qImport').disabled = !(Q.s && Q.s.ready);
+    $('qMore').classList.remove('hidden');
+    $('qNote').textContent = 'import failed: ' + (job.error || 'unknown');
+    return;
+  }
+  $('qBar').classList.add('hidden');
+  $('qImport').classList.add('hidden');
+  const r = job.result || {};
+  const v = r.verified || {};
+  $('qHead').textContent = 'Imported ' + plural(r.laps || 0, 'lap') +
+    (Q.s && Q.s.track_name ? ' at ' + Q.s.track_name : '');
+  $('qMeta').textContent = v.ok
+    ? 'checked on disk; the upload can be deleted below'
+    : 'written, but the check found a problem — see the review below';
+  $('qWarn').textContent = '';
+  $('qNote').textContent = '';
+  const watch = (r.lap_ids || [])[0];
+  if (watch) {
+    $('qMore').textContent = 'watch it';
+    $('qMore').classList.remove('hidden');
+    $('qMore').onclick = async () => {
+      S.impDone = true;
+      await setMode('session');
+      await selectLap(watch);
+    };
+  }
+}
+
+$('qImport').onclick = quickImport;
+function quickMore() { if (Q.folder) importFolder(Q.folder.path); }
+$('qMore').onclick = quickMore;
+/* Ticking it does not import what is on the card now: it says "by itself
+ * once both are in", and this one is waiting for a person already. */
+$('qAuto').addEventListener('change', (e) => {
+  try { localStorage.setItem(AUTO_KEY, e.target.checked ? '1' : '0'); }
+  catch (err) { /* a private window: nothing to remember it in */ }
+});
 
 for (const id of ['upFiles', 'upFilesAny']) {
   $(id).addEventListener('change', (e) => {
@@ -3123,7 +3335,6 @@ for (const id of ['upFiles', 'upFilesAny']) {
     uploadFiles(files);
   });
 }
-$('upImport').onclick = () => { if (UP.folder) importFolder(UP.folder.path); };
 $('upMore').onclick = resetUpload;
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible' && UP.running) {
@@ -3154,6 +3365,10 @@ window.addEventListener('beforeunload', (e) => {
  * folders under the inbox rather than anywhere on a disk. */
 function applyServerMode() {
   if (!CFG.headless) return;
+  /* On a server, files arrive by upload -- from a phone, at the track -- so
+   * the upload card leads the library tab instead of sitting under the
+   * library and the exports, three screens down on a phone. */
+  $('impApp').prepend($('upCard'));
   $('srcBrowse').classList.add('hidden');
   $('dropTitle').textContent = 'Import a folder on the server';
   $('dropWhy').textContent = 'an upload from above, or a folder under ' +
@@ -3172,11 +3387,15 @@ async function loadConfig() {
 requestAnimationFrame(tick);
 /* The hash names the screen, so a reload keeps it and a link can point at one:
  * `#library` for the library tab, `#compare` for the laps tab with a comparison
- * already up. */
+ * already up, `#add` for the library tab scrolled to the upload card -- what a
+ * phone's shortcut to "send a session" should open. */
 const WANT = (window.location && window.location.hash || '').replace('#', '');
 loadConfig()
   .then(() => {
-    if (WANT === 'library' || WANT === 'import') setMode('import');
+    if (WANT === 'library' || WANT === 'import' || WANT === 'add') {
+      setMode('import');
+    }
+    if (WANT === 'add') $('upCard').scrollIntoView({ block: 'start' });
     return loadLibrary();
   })
   .then(() => {

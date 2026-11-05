@@ -210,18 +210,45 @@
         <div class="uprow">
           <input type="text" id="upName" autocomplete="off"
                  placeholder="name this upload (optional)">
-          <label class="btn primary big" for="upFiles">Choose files…</label>
+          <label class="btn primary big" for="upFiles"
+                 id="upChoose">Choose files…</label>
         </div>
         <input type="file" id="upFiles" class="vh" multiple
                accept="video/*,.csv,text/csv,.mov,.mp4,.m4v,.mkv,.avi,.insv,.lrv">
         <input type="file" id="upFilesAny" class="vh" multiple>
+        <span class="muted small">On an iPhone, pick the RaceChrono CSV from
+          Files, then choose again for the video from Photos. Both go into the
+          same upload, and it is checked once they are in.</span>
         <span class="muted small">Keep this page open and the screen on until
           it says done. A camera file greyed out in the picker?
           <label class="act" for="upFilesAny">choose any file type</label></span>
       </div>
       <div id="upList"></div>
+
+      <!-- Once an upload is in: what importing it would do, the names it
+           would get, and one button. -->
+      <div id="upReady" class="hidden">
+        <div id="qHead" class="big"></div>
+        <div id="qMeta" class="muted"></div>
+        <div id="qWarn" class="bad"></div>
+        <div id="qNames">
+          <div class="opt field"><span class="lbl">event</span>
+            <input type="text" id="qEvent" autocomplete="off"></div>
+          <div class="opt field" id="qTrackRow"><span class="lbl">new track</span>
+            <input type="text" id="qTrack" autocomplete="off"></div>
+        </div>
+        <div class="cmprow">
+          <button id="qImport" class="primary big">Import</button>
+          <button id="qMore" class="ghost">more options</button>
+          <span id="qNote" class="muted"></span>
+        </div>
+        <div class="progress hidden" id="qBar"><i id="qFill"></i></div>
+        <label class="opt check" id="qAutoRow"><input type="checkbox" id="qAuto">
+          <span>import by itself once a CSV and its video are both in</span>
+        </label>
+      </div>
+
       <div class="cmprow hidden" id="upDone">
-        <button id="upImport" class="primary big">Import this upload</button>
         <button id="upMore" class="ghost">start another upload</button>
       </div>
       <div id="upFolders"></div>
